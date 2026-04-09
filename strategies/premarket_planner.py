@@ -716,9 +716,15 @@ def handle_ai_result(symbol: str, ai_reply: str):
         print(f"⚠️ AI 未返回 JSON 代码块")
         tg_send(f"⚠️ {symbol} 盘前谋划 AI 未返回网格 JSON")
 
-    # 2. 推送 AI 分析报告 (截断防止 TG 消息过长)
-    report = ai_reply[:3500] if len(ai_reply) > 3500 else ai_reply
-    tg_send(f"🧠 **【盘前策略报告】** {symbol}\n{report}")
+    # 2. 推送 AI 分析报告 (分段发送防止 TG 消息过长)
+    chunk_size = 3500
+    if len(ai_reply) <= chunk_size:
+        tg_send(f"🧠 **【盘前策略报告】** {symbol}\n{ai_reply}")
+    else:
+        chunks = [ai_reply[i:i+chunk_size] for i in range(0, len(ai_reply), chunk_size)]
+        for idx, chunk in enumerate(chunks):
+            title = f"🧠 **【盘前策略报告】** {symbol} (Part {idx+1}/{len(chunks)})"
+            tg_send(f"{title}\n{chunk}")
 
 
 # ==========================================
