@@ -29,10 +29,10 @@ from dotenv import load_dotenv, find_dotenv
 
 # ==========================================================
 # 📦 路径设置：将 longbridge/ 加入 sys.path，以便寻址 longbridge_server
-# 目录结构: For-OpenClaw/longbridge/, For-OpenClaw/notion/
+# 目录结构: for_openclaw/longbridge/, for_openclaw/notion/
 # ==========================================================
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # For-OpenClaw/notion/
-_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # For-OpenClaw/
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/notion/
+_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
 sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
 
 # 延迟导入：等 dotenv 加载完毕再 import，避免长桥 SDK 在 .env 读取前初始化失败

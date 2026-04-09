@@ -1,8 +1,9 @@
-# 文件名: longbridge_server.py (部署在 VPS 上 For-OpenClaw/longbridge/ 目录，供 OpenClaw 的 strategies 层调用)
+# 文件名: longbridge_server.py (部署在 VPS 上 for_openclaw/longbridge/ 目录，供 OpenClaw 的 strategies 层调用)
 import os
 import sys
 import json
 import logging
+import pytz
 from datetime import datetime, timedelta, date
 import requests
 import pandas as pd
@@ -922,6 +923,7 @@ def get_option_market_data(symbols: list):
 def subscribe_market_data(symbols: list[str]):
     """ 订阅指定股票的实时行情并立刻获取一次快照 """
     try:
+        quote_ctx = get_ctx()
         quote_ctx.subscribe(symbols, [SubType.Quote])
         return {"status": "SUCCESS", "message": f"Subscribed to {symbols}"}
     except Exception as e:
@@ -957,6 +959,7 @@ def get_live_snapshot(symbol: str = None):
     # ==========================================
     try:
         # 直接调用 trade_ctx 主动拉取今日订单
+        trade_ctx = get_trade_ctx()
         # 只要挂了单，服务器就一定有记录，绝不会为空
         orders_resp = trade_ctx.today_orders()
         active_orders = {}
@@ -991,6 +994,7 @@ def get_account_asset():
     交易前查验账户可用购买力(buy_power)与持仓。
     """
     try:
+        trade_ctx = get_trade_ctx()
         # 1. 安全获取资金余额
         balance_resp = trade_ctx.account_balance()
         
@@ -1002,7 +1006,16 @@ def get_account_asset():
         else:
             b_list = balance_resp
             
-        buy_power = str(b_list[0].buy_power) if b_list and len(b_list) > 0 else "0"
+        buy_power = "0"
+        cash_info = {}
+        if b_list and len(b_list) > 0:
+            buy_power = str(b_list[0].buy_power)
+            cash_infos = getattr(b_list[0], "cash_infos", getattr(b_list[0], "cash_info", []))
+            for c_info in cash_infos:
+                curr = str(getattr(c_info, "currency", ""))
+                cash_val = str(getattr(c_info, "available_cash", "0"))
+                if curr:
+                    cash_info[curr] = cash_val
 
         # 2. 安全获取股票持仓
         pos_resp = trade_ctx.stock_positions()
@@ -1034,6 +1047,7 @@ def get_account_asset():
                     
         return {
             "buy_power": buy_power, 
+            "cash_info": cash_info,
             "positions": positions
         }
         
@@ -1352,15 +1366,15 @@ def _logic_get_trading_days(market: str = "HK", start: str = None, end: str = No
 
         trade_days = []
         half_days = set()
-        if hasattr(resp, 'half_trade_day'):
-            for d in resp.half_trade_day:
+        if hasattr(resp, 'half_trading_days'):
+            for d in resp.half_trading_days:
                 half_days.add(str(d))
-        if hasattr(resp, 'trade_day'):
-            for d in resp.trade_day:
+        if hasattr(resp, 'trading_days'):
+            for d in resp.trading_days:
                 ds = str(d)
                 trade_days.append({"date": ds, "is_half_day": ds in half_days})
 
-        is_today_trading = str(local_today) in {str(d) for d in (resp.trade_day if hasattr(resp, 'trade_day') else [])}
+        is_today_trading = str(local_today) in [td['date'] for td in trade_days]
 
         return {
             "market": market.upper(),

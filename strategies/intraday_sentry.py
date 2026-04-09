@@ -11,10 +11,10 @@ from longbridge.openapi import Period, Market
 
 # ==========================================================
 # 📦 路径设置：将 longbridge/ 加入 sys.path，以便寻址 longbridge_server
-# 目录结构: For-OpenClaw/longbridge/, For-OpenClaw/strategies/
+# 目录结构: for_openclaw/longbridge/, for_openclaw/strategies/
 # ==========================================================
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # For-OpenClaw/strategies/
-_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # For-OpenClaw/
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/strategies/
+_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
 sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
 
 # ==========================================
@@ -235,7 +235,11 @@ def fetch_account_status(symbol: str) -> tuple[str, str, float]:
     try:
         asset = get_account_asset()
         buying_power = float(asset.get("buy_power", 0.0))
+        cash_info = asset.get("cash_info", {})
         positions = asset.get("positions", [])
+
+        target_currency = "USD" if symbol.upper().endswith(".US") else "HKD"
+        cash_val = cash_info.get(target_currency, "0")
 
         real_qty, real_cost = 0, 0.0
         for p in positions:
@@ -244,7 +248,7 @@ def fetch_account_status(symbol: str) -> tuple[str, str, float]:
                 real_cost = float(p.get("cost_price", 0.0))
 
         pos_str = f"已持仓 {real_qty} 股 (成本价 ${real_cost:.2f})" if real_qty > 0 else "0 股 (空仓)"
-        money_str = f"${buying_power:.2f}"
+        money_str = f"💵 可用现金({target_currency}): ${cash_val} | 💳 最大购买力: ${buying_power:.2f}"
         return money_str, pos_str, buying_power
     except Exception as e:
         print(f"⚠️ 账户状态获取失败: {e}")
@@ -702,17 +706,17 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
 # ===========================================================================
 
 # 长桥 SDK 返回的订单状态枚举字符串精确值（通过 str(order.status) 取得）
-# 将撤单中的状态单独拎出来，防止超时逻辑再触发一次重复撤单请求 
-_CANCELING_STATUSES = {"WaitToCancel", "PendingCancelStatus"}
+# 将撤单中的状态单独拎出来，防止超时逻辑再触发一次重复撤单请求
+_CANCELING_STATUSES = {"WaitToCancel", "PendingCancel"}
 
 _PENDING_STATUSES = {
     "NotReported", "ReplacedNotReported", "ProtectedNotReported", "VarietiesNotReported",
-    "WaitToNew", "NewStatus", "SubmittedStatus", "WaitToReplace", "PendingReplaceStatus",
-    "ReplacedStatus", "PartialFilledStatus"
+    "WaitToNew", "New", "Submitted", "WaitToReplace", "PendingReplace",
+    "Replaced", "PartialFilled"
 }
-_FILLED_STATUS = "FilledStatus"
+_FILLED_STATUS = "Filled"
 # 注意：PartialWithdrawal (部分撤单) 属于终结态，剩下的单子不会再成交了，必须抛给 AI 重新裁决
-_CANCELED_STATUSES = {"CanceledStatus", "RejectedStatus", "ExpiredStatus", "PartialWithdrawal"}
+_CANCELED_STATUSES = {"Canceled", "Rejected", "Expired", "PartialWithdrawal"}
 
 
 def _load_plan() -> dict | None:
@@ -785,11 +789,11 @@ def _check_pending_order(symbol: str, data: dict, plan: dict) -> tuple[bool, str
             # 挂单超时 → 战术撤单 + 强制唤醒
             print(f"⏳ [{datetime.now().strftime('%H:%M:%S')}] {symbol} 挂单 [{order_id}] 超时15分钟未成交，执行战术撤单！")
             cancel_result = cancel_order_by_id(order_id)
-            
+
             if cancel_result and "error" in cancel_result:
                 tg_send(f"🆘 **【撤单失败警报】**\n标的: {symbol}\n原因: {cancel_result['error']}\n⚠️ 请手动处理！")
                 return False, "", True  # 保持锁定，等下一轮重试
-                
+
             tg_send(f"⚠️ **【战术撤单】**\n标的: {symbol}\n原因: 挂单超时未成交，已由哨兵自动撤单以释放资金。")
             force_wakeup = True
             special_event_msg = "⚠️ 【系统强制事件：超时撤单】你之前的挂单因价格偏离已超时被系统撤销。资金已释放，请根据当前最新盘面重新进行动作裁决！"

@@ -18,10 +18,10 @@ from longbridge.openapi import Period, Market
 
 # ==========================================================
 # 📦 路径设置：将 longbridge/ 加入 sys.path，以便寻址 longbridge_server
-# 目录结构: For-OpenClaw/longbridge/, For-OpenClaw/strategies/
+# 目录结构: for_openclaw/longbridge/, for_openclaw/strategies/
 # ==========================================================
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # For-OpenClaw/strategies/
-_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # For-OpenClaw/
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/strategies/
+_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
 sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
 
 # ==========================================
@@ -151,14 +151,18 @@ def is_trading_day(market: str) -> bool:
 # 📡 Step 1: 账户状态
 # ==========================================
 
-def fetch_account_status() -> str:
+def fetch_account_status(market: str) -> str:
     """获取账户购买力与全部持仓，返回可读文本。"""
     try:
         asset = get_account_asset()
         buying_power = asset.get("buy_power", "0")
+        cash_info = asset.get("cash_info", {})
         positions = asset.get("positions", [])
 
-        lines = [f"💵 可用购买力: ${buying_power}"]
+        target_currency = "HKD" if market == "HK" else "USD"
+        cash_val = cash_info.get(target_currency, "0")
+
+        lines = [f"💵 可用现金({target_currency}): ${cash_val} | 💳 最大购买力(含融资): ${buying_power}"]
         if positions:
             for p in positions:
                 lines.append(
@@ -730,7 +734,7 @@ def process_single_symbol(symbol: str, market: str):
     try:
         # Step 1: 账户状态
         print(f"  📡 Step 1/7: 获取账户状态...")
-        account_str = fetch_account_status()
+        account_str = fetch_account_status(market)
         qty, cost = get_symbol_position(symbol)
         position_str = f"已持仓 {qty}股 (成本 ${cost:.2f})" if qty > 0 else "空仓"
 
