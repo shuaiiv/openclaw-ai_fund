@@ -181,8 +181,11 @@ def get_symbol_position(symbol: str) -> tuple[int, float]:
     try:
         asset = get_account_asset()
         for p in asset.get("positions", []):
-            if p.get("symbol") == symbol:
-                return int(p.get("available_qty", 0)), float(p.get("cost_price", 0.0))
+            # 长桥返回的港股代码格式可能是 700.HK, 9988.HK
+            # 我们传进来的可能是 0700.HK, 09988.HK，所以要做个去前导 0 的兼容对比
+            p_sym = p.get("symbol", "")
+            if p_sym == symbol or p_sym.lstrip('0') == symbol.lstrip('0'):
+                return int(float(p.get("available_qty", 0))), float(p.get("cost_price", 0.0))
     except Exception:
         pass
     return 0, 0.0
@@ -716,15 +719,17 @@ def handle_ai_result(symbol: str, ai_reply: str):
         print(f"⚠️ AI 未返回 JSON 代码块")
         tg_send(f"⚠️ {symbol} 盘前谋划 AI 未返回网格 JSON")
 
-    # 2. 推送 AI 分析报告 (分段发送防止 TG 消息过长)
-    chunk_size = 3500
-    if len(ai_reply) <= chunk_size:
-        tg_send(f"🧠 **【盘前策略报告】** {symbol}\n{ai_reply}")
+    # 2. 推送 AI 分析报告 (由于 TG 单条消息限制 4096 字符，若超过则分段发送)
+    prefix = f"🧠 **【盘前策略报告】** {symbol}\n"
+    max_len = 4000
+    if len(ai_reply) + len(prefix) <= 4096:
+        tg_send(prefix + ai_reply)
     else:
-        chunks = [ai_reply[i:i+chunk_size] for i in range(0, len(ai_reply), chunk_size)]
-        for idx, chunk in enumerate(chunks):
-            title = f"🧠 **【盘前策略报告】** {symbol} (Part {idx+1}/{len(chunks)})"
-            tg_send(f"{title}\n{chunk}")
+        # 分段发送
+        chunks = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
+        for i, chunk in enumerate(chunks):
+            header = prefix if i == 0 else f"🧠 **【盘前策略报告】** {symbol} (续 {i+1})\n"
+            tg_send(header + chunk)
 
 
 # ==========================================
@@ -762,7 +767,11 @@ def process_single_symbol(symbol: str, market: str):
 
         # Step 6: 期权数据
         print(f"  📡 Step 6/7: 获取期权数据...")
-        option_str = fetch_option_data(symbol)
+        # 0700.HK 可能没有期权或格式特殊，这里做个简单健壮性处理
+        if symbol.endswith(".HK"):
+            option_str = "港股暂不支持标准期权查询。"
+        else:
+            option_str = fetch_option_data(symbol)
 
         # Step 7: 最新资讯
         print(f"  📡 Step 7/7: 获取最新资讯...")

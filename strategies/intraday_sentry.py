@@ -243,8 +243,9 @@ def fetch_account_status(symbol: str) -> tuple[str, str, float]:
 
         real_qty, real_cost = 0, 0.0
         for p in positions:
-            if p.get("symbol") == symbol:
-                real_qty = int(p.get("available_qty", 0))
+            p_sym = p.get("symbol", "")
+            if p_sym == symbol or p_sym.lstrip('0') == symbol.lstrip('0'):
+                real_qty = int(float(p.get("available_qty", 0)))
                 real_cost = float(p.get("cost_price", 0.0))
 
         pos_str = f"已持仓 {real_qty} 股 (成本价 ${real_cost:.2f})" if real_qty > 0 else "0 股 (空仓)"
@@ -935,3 +936,4 @@ def run_sentry():
 
 if __name__ == "__main__":
     run_sentry()
+
