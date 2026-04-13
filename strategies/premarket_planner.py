@@ -38,6 +38,7 @@ from longbridge_server import (
     _logic_get_option_expiry_dates,           # Step 6: 期权到期日
     _logic_get_option_chain_by_date,          # Step 6: 期权链
     _logic_get_option_quotes,                 # Step 6: 期权行情 (含 YQ 降级)
+    close_contexts,                           # 释放 WebSocket 连接
 )
 
 load_dotenv(find_dotenv())
@@ -839,16 +840,25 @@ def run_premarket_batch(market: str):
         f"预计耗时: ~{len(symbols) * 5} 分钟 (每标的间隔5分钟)"
     )
 
-    for i, symbol in enumerate(symbols):
-        process_single_symbol(symbol, market)
+    try:
+        for i, symbol in enumerate(symbols):
+            process_single_symbol(symbol, market)
 
-        # Step 11: 标的间隔（最后一个不需要等）
-        if i < len(symbols) - 1:
-            print(f"\n⏳ 标的间隔冷却 {SYMBOL_INTERVAL // 60} 分钟...")
-            time.sleep(SYMBOL_INTERVAL)
+            # Step 11: 标的间隔（最后一个不需要等）
+            if i < len(symbols) - 1:
+                print(f"\n⏳ 标的间隔冷却 {SYMBOL_INTERVAL // 60} 分钟...")
+                time.sleep(SYMBOL_INTERVAL)
 
-    tg_send(f"✅ **【盘前谋划完成】** {market_name}，共分析 {len(symbols)} 只标的。")
-    print(f"\n✅ 盘前谋划批次完成: {market_name}")
+        tg_send(f"✅ **【盘前谋划完成】** {market_name}，共分析 {len(symbols)} 只标的。")
+        print(f"\n✅ 盘前谋划批次完成: {market_name}")
+
+    except Exception as e:
+        print(f"❌ 批量盘前谋划任务遭遇异常: {e}")
+
+    finally:
+        # **断开底层长连接**：用完即弃，不浪费 24 小时待机的配额
+        close_contexts()
+        print(f"\n✅ 盘前谋划批次完成并回收连接: {market_name}")
 
 
 def main():

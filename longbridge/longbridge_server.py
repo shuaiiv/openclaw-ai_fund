@@ -248,54 +248,67 @@ trade_ctx  = None
 _init_error: str = ""   # 记录初始化失败时的真实原因
 
 
-def _init_contexts():
-    """懒初始化：仅在首次调用时建立长连接，异常时记录真实错误信息。"""
-    global quote_ctx, trade_ctx, _init_error
-    if quote_ctx is not None:
-        return  # 已初始化，直接返回
-
-    import traceback
-    try:
-        cfg = get_lb_config()
-
-        # 1. 行情 Context（绑定实时行情回调）
-        quote_ctx = QuoteContext(cfg)
-        quote_ctx.set_on_quote(on_quote)
-
-        # 2. 交易 Context（绑定订单回调，订阅私人推送）
-        trade_ctx = TradeContext(cfg)
-        trade_ctx.set_on_order_changed(on_order_changed)
-        trade_ctx.subscribe([TopicType.Private])
-
-        _init_error = ""
-        print("✅ LongBridge Contexts 初始化成功", flush=True)
-
-    except Exception as e:
-        _init_error = traceback.format_exc()
-        quote_ctx  = None
-        trade_ctx  = None
-        # 直接 print，不依赖 logging 级别过滤
-        print(f"❌ LongBridge Contexts 初始化失败:\n{_init_error}", flush=True)
-
-
 def get_ctx() -> QuoteContext:
     """获取行情 Context（懒初始化，首次调用时建立连接）"""
-    _init_contexts()
+    global quote_ctx, _init_error
     if quote_ctx is None:
-        raise RuntimeError(
-            f"LongBridge QuoteContext 初始化失败，真实原因:\n{_init_error}"
-        )
+        try:
+            cfg = get_lb_config()
+            quote_ctx = QuoteContext(cfg)
+            quote_ctx.set_on_quote(on_quote)
+            _init_error = ""
+        except Exception:
+            import traceback
+            _init_error = traceback.format_exc()
+            quote_ctx = None
+            print(f"❌ LongBridge Quote 初始化失败:\n{_init_error}", flush=True)
+            raise RuntimeError(f"QuoteContext 初始化失败：\n{_init_error}")
     return quote_ctx
 
 
 def get_trade_ctx() -> TradeContext:
     """获取交易 Context（懒初始化，首次调用时建立连接）"""
-    _init_contexts()
+    global trade_ctx, _init_error
     if trade_ctx is None:
-        raise RuntimeError(
-            f"LongBridge TradeContext 初始化失败，真实原因:\n{_init_error}"
-        )
+        try:
+            cfg = get_lb_config()
+            trade_ctx = TradeContext(cfg)
+            trade_ctx.set_on_order_changed(on_order_changed)
+            try:
+                trade_ctx.subscribe([TopicType.Private])
+            except Exception as e:
+                print(f"⚠️ 交易私有推送(订单状态)订阅失败，可能达到连接数限制，继续运行: {e}", flush=True)
+            _init_error = ""
+        except Exception:
+            import traceback
+            _init_error = traceback.format_exc()
+            trade_ctx = None
+            print(f"❌ LongBridge Trade 初始化失败:\n{_init_error}", flush=True)
+            raise RuntimeError(f"TradeContext 初始化失败：\n{_init_error}")
     return trade_ctx
+
+
+def close_contexts():
+    """主动断开并清理长桥底层长连接，释放额度"""
+    global quote_ctx, trade_ctx
+    
+    if quote_ctx is not None:
+        if hasattr(quote_ctx, 'close'):
+            try:
+                quote_ctx.close()
+            except Exception:
+                pass
+        quote_ctx = None
+
+    if trade_ctx is not None:
+        if hasattr(trade_ctx, 'close'):
+            try:
+                trade_ctx.close()
+            except Exception:
+                pass
+        trade_ctx = None
+        
+    print("🔌 [连接回收] 所有长桥 WebSocket 会话已断开销毁。", flush=True)
 
 
 # ==========================================

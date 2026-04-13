@@ -36,6 +36,7 @@ from longbridge_server import (
     cancel_order_by_id,                 # 撤单
     get_order_status_by_id,             # 查询订单状态
     _logic_get_trading_days,            # 交易日查询
+    close_contexts,                     # 释放 WebSocket 连接
 )
 
 load_dotenv(find_dotenv())
@@ -809,7 +810,7 @@ def _check_pending_order(symbol: str, data: dict, plan: dict) -> tuple[bool, str
         print(f"✅ {symbol} 挂单 [{order_id}] 已完全成交！")
         tg_send(f"🎉 **【订单成交捷报】**\n标的: {symbol}\n状态: 完全成交 (Filled)\n下一步: 正在唤醒大脑重铸网格...")
         force_wakeup = True
-        special_event_msg = "🎉 【系统强制事件：订单成交】你上一笔订单已完全成交！当前底牌(仓位/资金)已发生物理变化，请根据最新底牌更新你的 status 并重铸网格！"
+        special_event_msg = "🎉 【系统强制事件：订单成交】你上一笔订单已完全成交！当前底牌已变，请根据最新资金和仓位更新 status 并重铸网格！⚠️警告：本次唤醒纯为了更新网格以配合新仓位。你必须严格输出 [ACTION: HOLD, REASON: 订单成交重铸网格]，绝对禁止在成交后立刻再次下单！"
         del data["pending_order"]
 
     elif order_status in _CANCELED_STATUSES:
@@ -873,6 +874,7 @@ def run_sentry():
                     status_parts.append("美股今日休市")
                 status_info = " | ".join(status_parts) if status_parts else "非交易时段"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] 💤 {status_info}，休眠 {hrs}h{mins}m 后重新检查...")
+                close_contexts()  # 当股市收盘真正睡觉时再断开连接
                 time.sleep(sleep_seconds)
                 continue
 
@@ -929,7 +931,9 @@ def run_sentry():
                     process_zone_hit(symbol, data, current_price, zone_name, zone_info, special_event_msg)
 
         except Exception as e:
-            print(f"哨兵轮询异常: {e}")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚨 哨兵监控遭遇异常: {e}")
+            
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ♻️ 本轮巡视结束，休眠 5 分钟...\n")
 
         time.sleep(POLL_INTERVAL)
 
