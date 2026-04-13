@@ -11,13 +11,9 @@ from yahooquery import Ticker
 import re
 from decimal import Decimal
 from longbridge.openapi import (
-    TradeContext, 
-    SubType, 
-    PushQuote, 
-    PushOrderChanged, 
-    TopicType,
-    OrderType, 
-    OrderSide, 
+    TradeContext,
+    OrderType,
+    OrderSide,
     TimeInForceType
 )
 # 创建标准请求会话（不依赖 curl_cffi）
@@ -51,54 +47,6 @@ def send_tg_notification(text):
     except Exception as e:
         print(f"TG Push Failed: {e}")
 
-# ==========================================
-# 🔥 全局内存状态机 (接收 WebSocket 推送)
-# ==========================================
-_LIVE_CACHE = {
-    "quotes": {},
-    "orders": {}
-}
-
-def on_quote(symbol: str, event: PushQuote):
-    """ 长桥底层回调：当订阅的股票有实时行情时触发 """
-    _LIVE_CACHE["quotes"][symbol] = {
-        "last_done": str(event.last_done),
-        "timestamp": event.timestamp,
-        "updated_at": "Just Now"
-    }
-
-def on_order_changed(order_event):
-    """当订单状态发生变化时（长桥主动推送）"""
-    _LIVE_CACHE["orders"][order_event.order_id] = {
-        "symbol": order_event.symbol,
-        "status": order_event.status,
-        "executed_qty": str(order_event.executed_quantity)
-    }
-    
-    status_str = str(order_event.status)
-    
-    # 将长桥的英文状态翻译成中文，方便阅读
-    status_cn = status_str
-    if "New" in status_str or "Submitted" in status_str:
-        status_cn = "🟡 已挂单 (待成交)"
-    elif "Filled" in status_str:
-        status_cn = "🟢 已完全成交"
-    elif "Canceled" in status_str:
-        status_cn = "⚪️ 已撤单"
-    elif "Rejected" in status_str:
-        status_cn = "🔴 订单被拒"
-        
-    # 只要状态是上述几种，全部推送！
-    if status_cn != status_str: 
-        msg = (
-            f"🔔 **【底层订单雷达】**\n"
-            f"标的: {order_event.symbol}\n"
-            f"状态: {status_cn}\n"
-            f"成交数量: {order_event.executed_quantity}\n"
-            f"订单价格: {order_event.price}\n"
-            f"*(耗时 0.01 秒，由底层直推)*"
-        )
-        send_tg_notification(msg) # 调用你前面写的发送函数
 
 # ==========================================
 # 🔇 环境配置
@@ -255,7 +203,6 @@ def get_ctx() -> QuoteContext:
         try:
             cfg = get_lb_config()
             quote_ctx = QuoteContext(cfg)
-            quote_ctx.set_on_quote(on_quote)
             _init_error = ""
         except Exception:
             import traceback
@@ -273,11 +220,6 @@ def get_trade_ctx() -> TradeContext:
         try:
             cfg = get_lb_config()
             trade_ctx = TradeContext(cfg)
-            trade_ctx.set_on_order_changed(on_order_changed)
-            try:
-                trade_ctx.subscribe([TopicType.Private])
-            except Exception as e:
-                print(f"⚠️ 交易私有推送(订单状态)订阅失败，可能达到连接数限制，继续运行: {e}", flush=True)
             _init_error = ""
         except Exception:
             import traceback
@@ -290,8 +232,8 @@ def get_trade_ctx() -> TradeContext:
 
 def close_contexts():
     """主动断开并清理长桥底层长连接，释放额度"""
-    global quote_ctx, trade_ctx
-    
+    global quote_ctx, trade_ctx, _init_error
+
     if quote_ctx is not None:
         if hasattr(quote_ctx, 'close'):
             try:
@@ -307,7 +249,8 @@ def close_contexts():
             except Exception:
                 pass
         trade_ctx = None
-        
+
+    _init_error = ""   # 清空初始化错误状态，保持状态机一致
     print("🔌 [连接回收] 所有长桥 WebSocket 会话已断开销毁。", flush=True)
 
 
@@ -823,7 +766,7 @@ def get_market_temperature_history(market: str = "HK", days: int = 30):
     except Exception as e:
         return {"error": f"Error: {str(e)}"}
 
-# 🔥 恢复并重构：历史 K 线查询工具
+# 🔥 历史 K 线查询工具
 @mcp.tool()
 def get_history_candlesticks(symbol: str, period: str = "day", start: str = None, end: str = None):
     """
@@ -842,29 +785,24 @@ def get_history_candlesticks(symbol: str, period: str = "day", start: str = None
     try:
         target_period = PERIOD_MAP.get(period.lower(), Period.Day)
 
-        # 2. 参数处理：日期
         if not end:
             end_d = datetime.now().date()
         else:
             end_d = datetime.strptime(end, "%Y-%m-%d").date()
-            
+
         if not start:
-            # 🚨 核心改动：如果 AI 偷懒没传 start，默认只给它近 30 天的，而不是 365 天！
-            # 如果是分钟线，默认只给近 3 天！
             days_to_subtract = 3 if "min" in period.lower() else 30
             start_d = end_d - timedelta(days=days_to_subtract)
         else:
             start_d = datetime.strptime(start, "%Y-%m-%d").date()
 
-        # 3. 调用统一的逻辑层函数
         data = _logic_get_history_kline(symbol, target_period, start_d, end_d)
-        
-        # 4. 后处理：计算极值，方便 AI 回答
+
         high_val = -float('inf')
         low_val = float('inf')
         high_date = ""
         low_date = ""
-        
+
         for item in data:
             if "error" in item: continue
             if item['h'] > high_val:
@@ -883,7 +821,7 @@ def get_history_candlesticks(symbol: str, period: str = "day", start: str = None
                 "lowest": {"price": low_val, "date": low_date} if low_val != float('inf') else None,
                 "count": len(data)
             },
-            "k_line_data": data, 
+            "k_line_data": data,
             "_ai_instruction": f"请根据 K 线数据回答用户问题。如需分析趋势，请参考 summary 中的最高/最低点。如果数据量较大，无需列出所有数据，只需总结关键走势。"
         }
 
@@ -930,71 +868,43 @@ def get_option_market_data(symbols: list):
     }
 
 # ==========================================
-# 📡 实时订阅引擎 (Push)
 # ==========================================
-@mcp.tool()
-def subscribe_market_data(symbols: list[str]):
-    """ 订阅指定股票的实时行情并立刻获取一次快照 """
-    try:
-        quote_ctx = get_ctx()
-        quote_ctx.subscribe(symbols, [SubType.Quote])
-        return {"status": "SUCCESS", "message": f"Subscribed to {symbols}"}
-    except Exception as e:
-        return {"error": str(e)}
-
+# 📡 实时行情与订单快照
+# ==========================================
 @mcp.tool()
 def get_live_snapshot(symbol: str = None):
     """
-    【AI 决策核心】读取实时行情与订单快照。
-    采用“WebSocket极速内存为主，API主动拉取为辅”的双引擎自愈机制。
+    获取实时行情与今日订单状态（主动 API 拉取）。
+    - symbol: 可选，指定标的代码；不传则只返回今日订单状态。
     """
     result = {
-        "source": "WebSocket Cache",
+        "source": "API Pull",
         "quotes": {},
         "orders": {}
     }
-    
-    # ==========================================
-    # 1. 行情兜底 (Quote Fallback)
-    # ==========================================
+
+    # 1. 行情（主动 API 拉取）
     if symbol:
-        cached_quote = _LIVE_CACHE["quotes"].get(symbol)
-        if cached_quote:
-            result["quotes"][symbol] = cached_quote
-        else:
-            result["quotes"][symbol] = _logic_get_live_quote(symbol) # 使用主动拉取
-            result["source"] = "API Pull (Fallback)"
-    else:
-        result["quotes"] = _LIVE_CACHE["quotes"]
-        
-    # ==========================================
-    # 2. 订单兜底 (Order Fallback - 解决模拟仓延迟)
-    # ==========================================
+        result["quotes"][symbol] = _logic_get_live_quote(symbol)
+
+    # 2. 今日订单状态（API 直接拉取）
     try:
-        # 直接调用 trade_ctx 主动拉取今日订单
         trade_ctx = get_trade_ctx()
-        # 只要挂了单，服务器就一定有记录，绝不会为空
         orders_resp = trade_ctx.today_orders()
         active_orders = {}
-        
         if orders_resp:
             for order in orders_resp:
                 active_orders[order.order_id] = {
                     "symbol": order.symbol,
                     "side": str(order.side),
-                    "status": str(order.status).replace("OrderStatus.", ""),  # 将 Rust 枚举转为字符串
+                    "status": str(order.status).replace("OrderStatus.", ""),
                     "executed_qty": str(order.executed_quantity),
                     "price": str(order.price)
                 }
-        
-        # 强制合并到结果中返回
         result["orders"] = active_orders
-        
     except Exception as e:
-        # 如果拉取失败，退回使用 WebSocket 缓存
-        result["orders"] = _LIVE_CACHE["orders"] 
         result["order_error"] = str(e)
-        
+
     return result
 
 # ==========================================
