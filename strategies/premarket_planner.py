@@ -23,6 +23,7 @@ from longbridge.openapi import Period, Market
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/strategies/
 _ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
 sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
+sys.path.insert(0, os.path.join(_ROOT_DIR, "futu"))        # 将 futu/ 加入搜索路径
 
 # ==========================================
 # 📦 从 longbridge_server 导入封装好的函数
@@ -35,10 +36,15 @@ from longbridge_server import (
     _logic_get_static_info,                   # Step 3: 标的基本信息
     _logic_get_financial_indexes,             # Step 3: 估值指标 (支持自定义)
     _logic_get_history_kline,                 # Step 4+5: K 线数据
-    _logic_get_option_expiry_dates,           # Step 6: 期权到期日
-    _logic_get_option_chain_by_date,          # Step 6: 期权链
-    _logic_get_option_quotes,                 # Step 6: 期权行情 (含 YQ 降级)
     close_contexts,                           # 释放 WebSocket 连接
+)
+
+# 期权模块使用富途 API
+from futu_options_server import (
+    _logic_get_expiry_dates,                  # Step 6: 期权到期日
+    _logic_get_option_chain,                  # Step 6: 期权链
+    _logic_get_option_snapshots,              # Step 6: 期权行情(含 YQ 降级)
+    close_context as close_futu_context,      # 释放富途 OpenD 连接
 )
 
 load_dotenv(find_dotenv())
@@ -453,6 +459,26 @@ def fetch_min10_kline(symbol: str) -> str:
     return "\n".join(lines)
 
 
+# ==========================================
+# 🛠️ 股票代码格式转换工具
+# ==========================================
+
+def lb_to_futu(symbol: str) -> str:
+    """
+    将长桥格式代码转换为富途格式代码。
+    长桥: 'AAPL.US' / '0700.HK' / '9988.HK'
+    富途: 'US.AAPL' / 'HK.00700' / 'HK.09988'
+
+    注意: 富途港股代码固定 5 位，需补零；美股代码直接拼接。
+    """
+    parts = symbol.rsplit(".", 1)
+    if len(parts) != 2:
+        return symbol  # 无法识别时原样返回
+    ticker, market = parts[0], parts[1].upper()
+    if market == "HK":
+        ticker = ticker.lstrip("0").zfill(5)   # 去掉多余前导零后补足为 5 位
+    return f"{market}.{ticker}"
+
 
 # ==========================================
 # 📡 Step 6: 期权信息
@@ -461,27 +487,37 @@ def fetch_min10_kline(symbol: str) -> str:
 def fetch_option_data(symbol: str, current_price: float = 0) -> str:
     """
     获取标的的期权信息：本周末/两周后/四周后三个到期日的 ATM 合约深度数据。
+    输入 symbol 使用长桥格式，内部自动转换为富途格式。
     """
     try:
-        opt_dates_raw = _logic_get_option_expiry_dates(symbol)
+        futu_code = lb_to_futu(symbol)  # e.g. "AAPL.US" -> "US.AAPL"
+        opt_dates_raw = _logic_get_expiry_dates(futu_code)
+
+        if isinstance(opt_dates_raw, dict) and "error" in opt_dates_raw:
+            return f"期权到期日获取失败: {opt_dates_raw['error']}"
         if not isinstance(opt_dates_raw, list) or not opt_dates_raw:
             return "该标的暂无期权数据。"
 
         today = datetime.now().date()
-        parsed_dates = []
-        for d in opt_dates_raw:
-            parsed_dates.append(
-                datetime.strptime(d.replace("-", ""), "%Y%m%d").date()
-                if isinstance(d, str) else d
-            )
-        future_dates = sorted(d for d in parsed_dates if d > today)
+        # opt_dates_raw 每条包含 strike_time 字段
+        future_dates = []
+        for r in opt_dates_raw:
+            date_str = r.get("strike_time", "")
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if d > today:
+                    future_dates.append(d)
+            except (ValueError, TypeError):
+                pass
+        future_dates = sorted(future_dates)
+
         if not future_dates:
             return "该标的暂无未来期权到期日。"
 
         # 计算目标到期日
         days_to_friday = (4 - today.weekday()) % 7 or 7
-        this_friday = today + timedelta(days=days_to_friday)
-        two_weeks_out = today + timedelta(days=14)
+        this_friday    = today + timedelta(days=days_to_friday)
+        two_weeks_out  = today + timedelta(days=14)
         four_weeks_out = today + timedelta(days=28)
 
         def pick_closest(dates, target):
@@ -489,11 +525,10 @@ def fetch_option_data(symbol: str, current_price: float = 0) -> str:
 
         # 三个目标到期日
         target_dates = [
-            (pick_closest(future_dates, this_friday), "本周末"),
-            (pick_closest(future_dates, two_weeks_out), "两周后"),
+            (pick_closest(future_dates, this_friday),    "本周末"),
+            (pick_closest(future_dates, two_weeks_out),  "两周后"),
             (pick_closest(future_dates, four_weeks_out), "四周后"),
         ]
-        # 去重
         seen = set()
         unique_targets = []
         for d, label in target_dates:
@@ -507,37 +542,47 @@ def fetch_option_data(symbol: str, current_price: float = 0) -> str:
             quote = _logic_get_live_quote(symbol)
             current_price = quote.get("price", 0)
 
-        target_symbols: list[str] = []
-        date_labels: dict[str, str] = {}
+        # 收集 ATM 合约的 futu_code
+        target_symbols: list[str] = []       # futu 期权代码
+        date_labels: dict[str, str] = {}     # futu_code -> 标签
 
         for exp_date, label in unique_targets:
             exp_str = exp_date.strftime("%Y-%m-%d")
-            chain = _logic_get_option_chain_by_date(symbol, exp_str)
+            chain = _logic_get_option_chain(futu_code, exp_str)
             if not isinstance(chain, list) or not chain:
                 continue
-            # 找 ATM
-            atm = min(chain, key=lambda o: abs(o["strike_price"] - current_price))
-            for sym_key, direction in [("call_symbol", "Call"), ("put_symbol", "Put")]:
-                s = atm.get(sym_key, "")
-                if s:
-                    target_symbols.append(s)
-                    date_labels[s] = f"{label}({exp_str}) {direction} 行权价={atm['strike_price']}"
+
+            # 富途链每条有 option_type(“CALL”/“PUT”) + strike_price + futu_code
+            calls = [c for c in chain if "CALL" in str(c.get("option_type", "")).upper()]
+            puts  = [c for c in chain if "PUT"  in str(c.get("option_type", "")).upper()]
+
+            for contracts, direction in [(calls, "Call"), (puts, "Put")]:
+                if not contracts:
+                    continue
+                atm = min(contracts, key=lambda o: abs((o.get("strike_price") or 0) - current_price))
+                fc  = atm.get("futu_code", "")
+                sp  = atm.get("strike_price", "N/A")
+                if fc:
+                    target_symbols.append(fc)
+                    date_labels[fc] = f"{label}({exp_str}) {direction} 行权价={sp}"
 
         if not target_symbols:
             return "该标的暂无查询到有效期权合约。"
 
-        # 批量查行情
-        opt_quotes = _logic_get_option_quotes(target_symbols)
+        # 批量查行情（富途主通 → YahooQuery 自动降级）
+        opt_quotes = _logic_get_option_snapshots(target_symbols)
         if not isinstance(opt_quotes, list) or not opt_quotes:
             return "期权行情请求返回空。"
 
-        lines = ["🛡️ 期权深度分析 (ATM IV/OI):"]
+        lines = ["🛡️ 期权深度分析 (ATM IV/OI):　[🔗富途行情 | YQ 降级支持]　"]
         for q in opt_quotes:
             if "error" in q:
                 continue
-            lbl = date_labels.get(q["symbol"], q["symbol"])
+            fc  = q.get("futu_code", "")
+            lbl = date_labels.get(fc, fc)
             try:
-                iv_str = f"{float(q.get('implied_volatility')) * 100:.1f}%"
+                iv_val = q.get("implied_volatility")
+                iv_str = f"{float(iv_val):.1f}%" if iv_val is not None else "N/A"
             except (TypeError, ValueError):
                 iv_str = "N/A"
             src = q.get("_source", "")
@@ -545,7 +590,7 @@ def fetch_option_data(symbol: str, current_price: float = 0) -> str:
                 f"  📌 {lbl} | IV={iv_str} | "
                 f"OI={q.get('open_interest', 'N/A')} | "
                 f"Vol={q.get('volume', 'N/A')} | "
-                f"Last={q.get('last_done', 'N/A')}"
+                f"Last={q.get('last_price', 'N/A')}"
                 + (f" [{src}]" if src else "")
             )
 
@@ -556,6 +601,7 @@ def fetch_option_data(symbol: str, current_price: float = 0) -> str:
 
     except Exception as e:
         return f"期权数据暂不可用: {e}"
+
 
 
 # ==========================================
@@ -768,11 +814,8 @@ def process_single_symbol(symbol: str, market: str):
 
         # Step 6: 期权数据
         print(f"  📡 Step 6/7: 获取期权数据...")
-        # 0700.HK 可能没有期权或格式特殊，这里做个简单健壮性处理
-        if symbol.endswith(".HK"):
-            option_str = "港股暂不支持标准期权查询。"
-        else:
-            option_str = fetch_option_data(symbol)
+        # 富途 API 支持港股和美股期权，统一调用；内部已有完整容错
+        option_str = fetch_option_data(symbol)
 
         # Step 7: 最新资讯
         print(f"  📡 Step 7/7: 获取最新资讯...")
@@ -857,7 +900,8 @@ def run_premarket_batch(market: str):
 
     finally:
         # **断开底层长连接**：用完即弃，不浪费 24 小时待机的配额
-        close_contexts()
+        close_contexts()                   # 释放长桥 WebSocket 连接
+        close_futu_context()               # 释放富途 OpenD 连接
         print(f"\n✅ 盘前谋划批次完成并回收连接: {market_name}")
 
 

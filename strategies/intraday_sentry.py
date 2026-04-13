@@ -16,6 +16,7 @@ from longbridge.openapi import Period, Market
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/strategies/
 _ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
 sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
+sys.path.insert(0, os.path.join(_ROOT_DIR, "futu"))        # 将 futu/ 加入搜索路径
 
 # ==========================================
 # 📦 从 longbridge_server 导入所有封装好的函数
@@ -26,17 +27,22 @@ from longbridge_server import (
     _logic_get_live_quote,              # 获取单只股票实时行情
     _logic_get_capital_distribution,    # 获取主力资金分布
     _logic_get_history_kline,           # 获取历史 K 线 (返回 dict 列表)
-    _logic_get_option_expiry_dates,     # 获取期权到期日列表
-    _logic_get_option_chain_by_date,    # 获取指定到期日的期权链 (call/put 代码)
-    _logic_get_option_quotes,           # 获取期权深度行情 IV/OI (含 YahooQuery 降级)
     _logic_get_static_info,             # 获取标的基本静态信息
-    _logic_get_financial_indexes,       # 获取估值指标 (PE/PB/市值等)
+    _logic_get_financial_indexes,       # 获取估值指标 (PE/PB/市値等)
     _logic_get_market_temperature,      # 获取市场温度
     submit_trade_order,                 # 下单 (内置 TG 通知)
     cancel_order_by_id,                 # 撤单
     get_order_status_by_id,             # 查询订单状态
     _logic_get_trading_days,            # 交易日查询
     close_contexts,                     # 释放 WebSocket 连接
+)
+
+# 期权模块使用富途 API
+from futu_options_server import (
+    _logic_get_expiry_dates,            # 获取期权到期日列表
+    _logic_get_option_chain,            # 获取指定到期日的期权链 (futu 格式)
+    _logic_get_option_snapshots,        # 获取期权深度行情 IV/OI (含 YahooQuery 降级)
+    close_context as close_futu_context, # 释放富途 OpenD 连接
 )
 
 load_dotenv(find_dotenv())
@@ -380,31 +386,54 @@ def fetch_kline_data(symbol: str, current_price: float) -> tuple[str, float]:
         return f"当日K线拉取失败: {e}", 0.0
 
 
+def lb_to_futu(symbol: str) -> str:
+    """
+    将长桥格式代码转换为富途格式代码。
+    长桥: 'AAPL.US' / '0700.HK' / '9988.HK'
+    富途: 'US.AAPL' / 'HK.00700' / 'HK.09988'
+
+    注意: 富途港股代码固定 5 位，需补零；美股代码直接拼接。
+    """
+    parts = symbol.rsplit(".", 1)
+    if len(parts) != 2:
+        return symbol
+    ticker, market = parts[0], parts[1].upper()
+    if market == "HK":
+        ticker = ticker.lstrip("0").zfill(5)   # 去掉多余前导零后补足为 5 位
+    return f"{market}.{ticker}"
+
+
 def fetch_option_snapshot(symbol: str, current_price: float) -> str:
     """
     期权异动探针：智能选期（本周末 + 两周后）→ 提取 ATM 合约 → 查 IV/OI（含 YahooQuery 降级）。
+    输入 symbol 使用长桥格式，内部自动转换为富途格式。
     返回可读字符串。
     """
     try:
-        opt_dates_raw = _logic_get_option_expiry_dates(symbol)
+        futu_code = lb_to_futu(symbol)  # e.g. "AAPL.US" -> "US.AAPL"
+        opt_dates_raw = _logic_get_expiry_dates(futu_code)
+
+        if isinstance(opt_dates_raw, dict) and "error" in opt_dates_raw:
+            return f"期权到期日获取失败: {opt_dates_raw['error']}"
         if not isinstance(opt_dates_raw, list) or not opt_dates_raw:
-            raise ValueError("no expiry dates")
+            return "该标的暂无期权到期日。"
 
-        # 统一转为 date 对象并过滤历史日期
         today = datetime.now().date()
-        parsed_dates = []
-        for d in opt_dates_raw:
-            parsed_dates.append(
-                datetime.strptime(d.replace("-", ""), "%Y%m%d").date()
-                if isinstance(d, str) else d
-            )
-        future_dates = sorted(d for d in parsed_dates if d > today)
+        future_dates = []
+        for r in opt_dates_raw:
+            date_str = r.get("strike_time", "")
+            try:
+                d = datetime.strptime(date_str, "%Y-%m-%d").date()
+                if d > today:
+                    future_dates.append(d)
+            except (ValueError, TypeError):
+                pass
+        future_dates = sorted(future_dates)
         if not future_dates:
-            raise ValueError("no future expiry dates")
+            return "该标的暂无未来期权到期日。"
 
-        # 计算目标到期日：本周五 & 两周后
         days_to_friday = (4 - today.weekday()) % 7 or 7
-        this_friday  = today + timedelta(days=days_to_friday)
+        this_friday   = today + timedelta(days=days_to_friday)
         two_weeks_out = today + timedelta(days=14)
 
         def pick_closest(dates, target):
@@ -413,7 +442,6 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
         near_date = pick_closest(future_dates, this_friday)
         far_date  = pick_closest(future_dates, two_weeks_out)
 
-        # 对每个目标日期查询期权链，提取 ATM call + put 代码
         targets = [(near_date, "本周末")]
         if far_date != near_date:
             targets.append((far_date, "两周后"))
@@ -423,21 +451,29 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
 
         for exp_date, label in targets:
             exp_str = exp_date.strftime("%Y-%m-%d")
-            chain = _logic_get_option_chain_by_date(symbol, exp_str)
+            chain = _logic_get_option_chain(futu_code, exp_str)
             if not isinstance(chain, list) or not chain:
                 continue
-            atm = min(chain, key=lambda o: abs(o["strike_price"] - current_price))
-            for sym_key, direction in [("call_symbol", "Call"), ("put_symbol", "Put")]:
-                s = atm.get(sym_key, "")
-                if s:
-                    target_symbols.append(s)
-                    date_labels[s] = f"{label}({exp_str}) {direction} 行权价={atm['strike_price']}"
+
+            # 富途链每条有 option_type(“CALL”/“PUT”) + strike_price + futu_code
+            calls = [c for c in chain if "CALL" in str(c.get("option_type", "")).upper()]
+            puts  = [c for c in chain if "PUT"  in str(c.get("option_type", "")).upper()]
+
+            for contracts, direction in [(calls, "真 Call"), (puts, "真 Put")]:
+                if not contracts:
+                    continue
+                atm = min(contracts, key=lambda o: abs((o.get("strike_price") or 0) - current_price))
+                fc  = atm.get("futu_code", "")
+                sp  = atm.get("strike_price", "N/A")
+                if fc:
+                    target_symbols.append(fc)
+                    date_labels[fc] = f"{label}({exp_str}) {direction} 行权价={sp}"
 
         if not target_symbols:
             return "该标的暂无查询到有效期权合约。"
 
-        # 批量查行情（长桥官方 → YahooQuery 自动降级）
-        opt_quotes = _logic_get_option_quotes(target_symbols)
+        # 批量查行情（富途官方 → YahooQuery 自动降级）
+        opt_quotes = _logic_get_option_snapshots(target_symbols)
         if not isinstance(opt_quotes, list) or not opt_quotes:
             return "期权行情请求返回空。"
 
@@ -445,17 +481,19 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
         for q in opt_quotes:
             if "error" in q:
                 continue
-            lbl = date_labels.get(q["symbol"], q["symbol"])
+            fc  = q.get("futu_code", "")
+            lbl = date_labels.get(fc, fc)
             try:
-                iv_str = f"{float(q.get('implied_volatility'))*100:.1f}%"
+                iv_val = q.get("implied_volatility")
+                iv_str = f"{float(iv_val):.1f}%" if iv_val is not None else "N/A"
             except (TypeError, ValueError):
                 iv_str = "N/A"
             src = q.get("_source", "")
             lines.append(
                 f"  📌 {lbl} | IV={iv_str} | "
-                f"OI={q.get('open_interest','N/A')} | "
-                f"Vol={q.get('volume','N/A')} | "
-                f"Last={q.get('last_done','N/A')}"
+                f"OI={q.get('open_interest', 'N/A')} | "
+                f"Vol={q.get('volume', 'N/A')} | "
+                f"Last={q.get('last_price', 'N/A')}"
                 + (f" [{src}]" if src else "")
             )
 
@@ -463,7 +501,7 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
             return "期权行情匹配为空。"
 
         result = "期权深度分析 (ATM IV/OI 探针):\n" + "\n".join(lines)
-        if any("Fallback" in q.get("_source", "") for q in opt_quotes):
+        if any("降级" in q.get("_source", "") or "Fallback" in q.get("_source", "") for q in opt_quotes):
             result = "[降级通道 YahooQuery] " + result
         return result
 
@@ -874,7 +912,8 @@ def run_sentry():
                     status_parts.append("美股今日休市")
                 status_info = " | ".join(status_parts) if status_parts else "非交易时段"
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] 💤 {status_info}，休眠 {hrs}h{mins}m 后重新检查...")
-                close_contexts()  # 当股市收盘真正睡觉时再断开连接
+                close_contexts()        # 释放长桥 WebSocket：宿眠前断开长连接
+                close_futu_context()    # 释放富途 OpenD：同步回收连接配额
                 time.sleep(sleep_seconds)
                 continue
 
