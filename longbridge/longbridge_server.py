@@ -264,6 +264,7 @@ def _logic_get_live_quote(symbol: str):
         q_list = ctx.quote([symbol])
         if not q_list: return {"error": f"No quote for {symbol}"}
         q = q_list[0]
+        prev_close = float(q.prev_close) if q.prev_close else 0.0
         return {
             "symbol": symbol,
             "price": float(q.last_done),
@@ -271,8 +272,9 @@ def _logic_get_live_quote(symbol: str):
             "high": float(q.high),
             "low": float(q.low),
             "vol": int(q.volume),
+            "prev_close": prev_close,
             "timestamp": str(q.timestamp),
-            "change_rate": f"{(float(q.last_done)-float(q.prev_close))/float(q.prev_close)*100:+.2f}%" if float(q.prev_close) > 0 else "N/A"
+            "change_rate": f"{(float(q.last_done) - prev_close) / prev_close * 100:+.2f}%" if prev_close > 0 else "N/A"
         }
     except Exception as e:
         return {"error": str(e)}

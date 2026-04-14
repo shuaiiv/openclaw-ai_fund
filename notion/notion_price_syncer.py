@@ -39,11 +39,10 @@ sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加
 load_dotenv(find_dotenv())
 
 from longbridge_server import (          # noqa: E402
-    _logic_get_history_kline,            # 获取历史 K 线 → 用于提取 T-1 收盘价
-    _logic_get_live_quote,              # 获取港股实时价格（常规盘）
+    _logic_get_live_quote,              # 获取实时行情 → prev_close 字段用于 T-1 收盘价
     _logic_get_extended_quote,          # 获取美股延伸时段最新价（含盘前/盘后/夜盘）
 )
-from longbridge.openapi import Period    # noqa: E402  仅用于 Period.Day 枚举常量
+
 
 # 🤫 屏蔽 tzlocal 的无关告警
 warnings.filterwarnings("ignore", module="tzlocal")
@@ -97,14 +96,19 @@ def _query_all_positions(ds_id: str) -> list:
 
 def update_t1_price(market: str, ds_id: str):
     """
-    开盘前触发：通过 _logic_get_history_kline 取近 7 日日K线，
-    提取最后一条的收盘价写入 Notion 持仓表的 T-1 Closing Price 字段。
+    更新 T-1 收盘价，两个市场触发时机不同，但 last_done 在两种情况下都等于昨日收盘价：
+
+    - 🇺🇸 美股：常规盘收盘后 5 分钟（美东 16:05）触发。
+      此时市场刚收盘，last_done = 当日常规盘收盘价，即次日的 T-1 ✅
+
+    - 🇭🇰 港股：次日开盘前（港股 08:30）触发。
+      港股已收盘一夜，last_done 仍停留在昨日收盘价 = T-1 ✅
+
+    两种场景均使用 result["price"]（即 last_done），prev_close 是 T-2，不应使用。
     """
     print(f"\n🌅 [{market}] 更新 T-1 收盘价...")
     try:
         rows = _query_all_positions(ds_id)
-        end_date   = datetime.now().date()
-        start_date = end_date - timedelta(days=7)
 
         for row in rows:
             page_id  = row["id"]
@@ -112,18 +116,22 @@ def update_t1_price(market: str, ds_id: str):
             lb_code  = get_lb_code(raw_code, market)
 
             try:
-                klines = _logic_get_history_kline(lb_code, Period.Day, start_date, end_date)
-                # 检查返回值是否有效（_logic_get_history_kline 失败时返回 [{"error": ...}]）
-                if not klines or "error" in klines[0]:
-                    print(f"⚠️ {raw_code} K 线拉取失败: {klines}")
+                result = _logic_get_live_quote(lb_code)
+                if "error" in result:
+                    print(f"⚠️ {raw_code} 行情获取失败: {result['error']}")
                     continue
 
-                t1_price = float(klines[-1]["c"])   # 最后一条的收盘价
+                t1_price = result.get("price")   # last_done = 当日收盘价
+                if not t1_price:
+                    print(f"⚠️ {raw_code} 行情中 price 为空，跳过")
+                    continue
+
+                t1_price = float(t1_price)
                 notion.pages.update(
                     page_id=page_id,
                     properties={"T-1 Closing Price": {"number": t1_price}}
                 )
-                print(f"✅ {raw_code} ({lb_code}) T-1 价格: {t1_price:.3f}")
+                print(f"✅ {raw_code} ({lb_code}) T-1 收盘价: {t1_price:.3f}")
 
             except Exception as e:
                 print(f"❌ {raw_code} T-1 更新失败: {e}")
@@ -132,6 +140,7 @@ def update_t1_price(market: str, ds_id: str):
 
     except Exception as e:
         print(f"❌ [{market}] T-1 整体任务崩溃: {e}")
+
 
 
 # ===========================================================================
@@ -203,7 +212,7 @@ if __name__ == "__main__":
     # ──────────────────────────────────────────────────────────────
     # 🇭🇰 港股调度 (Asia/Hong_Kong)
     # ──────────────────────────────────────────────────────────────
-    # a. 开盘前 30 分钟 (09:00)：更新 T-1 收盘价
+    # a. 开盘前 60 分钟 (08:30)：更新 T-1 收盘价
     scheduler.add_job(
         update_t1_price, "cron",
         day_of_week="mon-fri", hour=8, minute=30,
@@ -258,7 +267,7 @@ if __name__ == "__main__":
     print(f"   美股: 16:05 更新 T-1，04:00-20:00 每 5 分钟延伸价 [US]")
 
     # 💡 调试时取消注释，立即跑一次：
-    update_t1_price("US", DB_POS_US)
+    # update_t1_price("US", DB_POS_US)
     # update_current_price("US", DB_POS_US)
 
     scheduler.start()

@@ -63,7 +63,7 @@ TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 OPENCLAW_URL = "http://127.0.0.1:18789/v1/chat/completions"
 OPENCLAW_HEADERS = {
     "Content-Type": "application/json",
-    "Authorization": "Bearer f1ad88e63cbbab03fce6872ba3fb47d342d032175dc83460",
+    "Authorization": f"Bearer {os.getenv('OPENCLAW_GATEWAY_TOKEN', '')}",
     "x-openclaw-scopes": "operator.admin,operator.write",
 }
 
@@ -143,7 +143,7 @@ _US_TZ = "America/New_York"
 
 # 交易时段定义（每个元素: ((start_h, start_m), (end_h, end_m))）
 _HK_SESSIONS = [((9, 30), (12, 0)), ((13, 0), (16, 0))]   # 港股 上午+下午
-_US_SESSIONS = [((9, 30), (16, 0))]                         # 美股 仅盘中
+_US_SESSIONS = [((9, 30), (16, 0)), ((16, 0), (20, 0))]   # 美股 盘中 + 盘后
 
 # 交易日缓存（每日只查询一次 API）
 _trading_day_cache: dict = {"date": None, "hk": None, "us": None}
@@ -405,7 +405,7 @@ def lb_to_futu(symbol: str) -> str:
 
 def fetch_option_snapshot(symbol: str, current_price: float) -> str:
     """
-    期权异动探针：智能选期（本周末 + 两周后）→ 提取 ATM 合约 → 查 IV/OI（含 YahooQuery 降级）。
+    期权异动探针：智能选期（本周末 + 两周后 + 四周后）→ 提取 ATM 合约 → 查 IV/OI（含 YahooQuery 降级）。
     输入 symbol 使用长桥格式，内部自动转换为富途格式。
     返回可读字符串。
     """
@@ -433,18 +433,24 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
             return "该标的暂无未来期权到期日。"
 
         days_to_friday = (4 - today.weekday()) % 7 or 7
-        this_friday   = today + timedelta(days=days_to_friday)
-        two_weeks_out = today + timedelta(days=14)
+        this_friday    = today + timedelta(days=days_to_friday)
+        two_weeks_out  = today + timedelta(days=14)
+        four_weeks_out = today + timedelta(days=28)
 
         def pick_closest(dates, target):
             return min(dates, key=lambda d: abs((d - target).days))
 
-        near_date = pick_closest(future_dates, this_friday)
-        far_date  = pick_closest(future_dates, two_weeks_out)
+        near_date       = pick_closest(future_dates, this_friday)
+        two_week_date   = pick_closest(future_dates, two_weeks_out)
+        four_week_date  = pick_closest(future_dates, four_weeks_out)
 
-        targets = [(near_date, "本周末")]
-        if far_date != near_date:
-            targets.append((far_date, "两周后"))
+        # 去重：三个目标日期可能重合
+        seen = set()
+        targets = []
+        for d, label in [(near_date, "本周末"), (two_week_date, "两周后"), (four_week_date, "四周后")]:
+            if d not in seen:
+                seen.add(d)
+                targets.append((d, label))
 
         target_symbols: list[str] = []
         date_labels: dict[str, str] = {}

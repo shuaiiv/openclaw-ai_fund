@@ -66,7 +66,7 @@ PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "premarket_planner_prompt.md")
 OPENCLAW_URL = "http://127.0.0.1:18789/v1/chat/completions"
 OPENCLAW_HEADERS = {
     "Content-Type": "application/json",
-    "Authorization": f"Bearer {os.getenv('OPENCLAW_API_KEY', 'f1ad88e63cbbab03fce6872ba3fb47d342d032175dc83460')}",
+    "Authorization": f"Bearer {os.getenv('OPENCLAW_GATEWAY_TOKEN', '')}",
     "x-openclaw-scopes": "operator.admin,operator.write",
 }
 
@@ -460,6 +460,53 @@ def fetch_min10_kline(symbol: str) -> str:
 
 
 # ==========================================
+# 📡 Step 5b: 美股盘前 5 分钟线 (US Only)
+# ==========================================
+
+def fetch_premarket_kline_us(symbol: str) -> str:
+    """
+    获取美股当日盘前时段的 5 分钟 K 线（常规盘开盘之前的盘前交易数据）。
+    时段范围：美东时间 04:00–09:29。
+    只适用于美股（.US 后缀），其他市场返回空字符串。
+    """
+    if not symbol.endswith(".US"):
+        return ""
+
+    try:
+        import pytz
+        et = pytz.timezone("America/New_York")
+        today = datetime.now().date()
+        k_lines = _logic_get_history_kline(symbol, Period.Min_5, today, today)
+
+        if not k_lines or "error" in k_lines[0]:
+            return "盘前 5 分钟线暂无数据。"
+
+        premarket = []
+        for k in k_lines:
+            try:
+                t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
+                t_et = pytz.utc.localize(t).astimezone(et)
+                h, m = t_et.hour, t_et.minute
+                # 盘前时段：04:00–09:29
+                if 4 <= h < 9 or (h == 9 and m < 30):
+                    premarket.append((t_et, k))
+            except Exception:
+                pass
+
+        if not premarket:
+            return "盘前时段暂无 5 分钟 K 线数据（可能常规盘尚未开始）。"
+
+        lines = [f"🌅 美股盘前 5min K 线 ({len(premarket)}条):",
+                 "时间(美东) | 开 | 高 | 低 | 收 | 成交量"]
+        for t_et, k in premarket:
+            lines.append(f"{t_et.strftime('%H:%M')} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}")
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"盘前 K 线获取失败: {e}"
+
+
+# ==========================================
 # 🛠️ 股票代码格式转换工具
 # ==========================================
 
@@ -650,10 +697,18 @@ def build_premarket_message(
     static_str: str,
     daily_kline_str: str,
     min_kline_str: str,
+    premarket_kline_str: str,
     option_str: str,
     news_str: str,
 ) -> str:
     """将所有盘面数据组装成发给 AI 的完整盘前分析提示词"""
+
+    # 仅美股且有盘前K线数据时插入独立段落
+    premarket_section = (
+        f"{'='*50}\n"
+        f"🌅 **五b、当日美股盘前 5min K 线**\n"
+        f"{premarket_kline_str}\n\n"
+    ) if premarket_kline_str else ""
 
     return (
         f"📋 **【盘前谋划数据投喂】** {symbol} ({market}股)\n"
@@ -677,8 +732,10 @@ def build_premarket_message(
         f"{daily_kline_str}\n\n"
 
         f"{'='*50}\n"
-        f"📈 **五、近3日15分钟K线微观结构**\n"
+        f"📈 **五、近3日10分钟K线微观结构**\n"
         f"{min_kline_str}\n\n"
+
+        + premarket_section +
 
         f"{'='*50}\n"
         f"🛡️ **六、期权链深度数据**\n"
@@ -697,6 +754,7 @@ def build_premarket_message(
         f"2. 在回复最末尾用 ` ```json ... ``` ` 输出该标的的网格交易计划（只输出 {symbol} 一只）\n"
         f"3. JSON 必须包含 status, macro_thesis, update_time, zones 字段\n"
     )
+
 
 
 # ==========================================
@@ -812,6 +870,12 @@ def process_single_symbol(symbol: str, market: str):
         print(f"  📡 Step 5/7: 获取短周期K线...")
         min_kline_str = fetch_min10_kline(symbol)
 
+        # Step 5b: 美股当日盘前 5min K线（仅美股）
+        premarket_kline_str = ""
+        if market == "US":
+            print(f"  📡 Step 5b: 获取美股盘前 5min K 线...")
+            premarket_kline_str = fetch_premarket_kline_us(symbol)
+
         # Step 6: 期权数据
         print(f"  📡 Step 6/7: 获取期权数据...")
         # 富途 API 支持港股和美股期权，统一调用；内部已有完整容错
@@ -832,6 +896,7 @@ def process_single_symbol(symbol: str, market: str):
             static_str=static_str,
             daily_kline_str=daily_kline_str,
             min_kline_str=min_kline_str,
+            premarket_kline_str=premarket_kline_str,
             option_str=option_str,
             news_str=news_str,
         )
