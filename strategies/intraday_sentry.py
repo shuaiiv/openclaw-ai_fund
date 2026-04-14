@@ -45,7 +45,11 @@ from futu_options_server import (
     close_context as close_futu_context, # 释放富途 OpenD 连接
 )
 
-load_dotenv(find_dotenv())
+
+# override=True 确保覆盖系统环境中可能存在的同名旧变量
+load_dotenv(load_dotenv(), override=True)
+
+
 TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN_CLAW")
 TG_CHAT_ID    = os.getenv("TG_CHAT_ID")
 _ROOT_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # OpenClaw/
@@ -985,4 +989,3 @@ def run_sentry():
 
 if __name__ == "__main__":
     run_sentry()
-

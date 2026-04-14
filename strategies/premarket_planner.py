@@ -47,7 +47,9 @@ from futu_options_server import (
     close_context as close_futu_context,      # 释放富途 OpenD 连接
 )
 
-load_dotenv(find_dotenv())
+# override=True 确保覆盖系统环境中可能存在的同名旧变量
+load_dotenv(load_dotenv(), override=True)
+
 
 # ==========================================
 # ⚙️ 配置层
