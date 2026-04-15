@@ -6,7 +6,7 @@ import re
 import requests
 from datetime import datetime, timedelta
 import pytz
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 from longbridge.openapi import Period, Market
 
 # ==========================================================
@@ -551,7 +551,7 @@ def build_wake_message(
         f"   - 💵 {money_str}\n"
         f"   - 📦 {pos_str}\n\n"
 
-        f"🧠 **【你的盘前宏观记忆 (大局观锚点)】**：\n"
+        f"💭 **【你的盘前宏观记忆 (大局观锚点)】**：\n"
         f"> {macro_thesis}\n\n"
 
         f"ℹ️ **【标的基本信息】**：\n{static_str}\n\n"
@@ -686,7 +686,7 @@ def handle_ai_verdict(symbol: str, ai_reply: str):
             print(f"❌ JSON 格式损坏: {e}")
 
     # 3. 推送 AI 报告
-    tg_send(f"🧠 **【🦞 自动裁决报告】**\n{ai_reply}")
+    tg_send(f"💭 **【🦞 自动裁决报告】**\n{ai_reply}")
 
 
 # ===========================================================================

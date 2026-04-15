@@ -13,7 +13,7 @@ import requests
 import schedule
 from datetime import datetime, timedelta, date
 import pytz
-from dotenv import load_dotenv, find_dotenv
+from dotenv import load_dotenv
 from longbridge.openapi import Period, Market
 
 # ==========================================================
@@ -827,7 +827,7 @@ def handle_ai_result(symbol: str, ai_reply: str):
         tg_send(f"⚠️ {symbol} 盘前谋划 AI 未返回网格 JSON")
 
     # 2. 推送 AI 分析报告 (由于 TG 单条消息限制 4096 字符，若超过则分段发送)
-    prefix = f"🧠 **【盘前策略报告】** {symbol}\n"
+    prefix = f"💭 **【盘前策略报告】** {symbol}\n"
     max_len = 4000
     if len(ai_reply) + len(prefix) <= 4096:
         tg_send(prefix + ai_reply)
@@ -835,7 +835,7 @@ def handle_ai_result(symbol: str, ai_reply: str):
         # 分段发送
         chunks = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
         for i, chunk in enumerate(chunks):
-            header = prefix if i == 0 else f"🧠 **【盘前策略报告】** {symbol} (续 {i+1})\n"
+            header = prefix if i == 0 else f"💭 **【盘前策略报告】** {symbol} (续 {i+1})\n"
             tg_send(header + chunk)
 
 

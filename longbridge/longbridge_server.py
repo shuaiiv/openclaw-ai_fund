@@ -992,7 +992,7 @@ def submit_trade_order(symbol: str, side: str, quantity: int, price: float, reas
     - side: 买卖方向，"Buy" 或 "Sell"
     - quantity: 交易股数
     - price: 限价单的触发价格
-    - reason: 🧠 你的核心交易理由（必填！必须详细描述你为什么在这个时刻下达这个订单，结合K线、期权和新闻的分析）。
+    - reason: 💭 你的核心交易理由（必填！必须详细描述你为什么在这个时刻下达这个订单，结合K线、期权和新闻的分析）。
     """
     try:
         # 这里保留你原本调用长桥 SDK 下单的代码
@@ -1017,7 +1017,7 @@ def submit_trade_order(symbol: str, side: str, quantity: int, price: float, reas
             f"📦 数量: {quantity} 股\n"
             f"💰 价格: ${price}\n"
             f"🆔 订单ID: {order_id}\n\n"
-            f"🧠 **AI 核心决策理由:**\n{reason}"
+            f"💭 **AI 核心决策理由:**\n{reason}"
         )
         send_tg_notification(msg)
         
