@@ -3,6 +3,7 @@
 #
 # 目录结构:
 #   longbridge/ - 长桥 SDK 封装核心服务
+#   futu/       - 富途 SDK 封装核心服务
 #   strategies/ - 量化交易策略 (盘前谋划 + 盘中哨兵)
 #   notion/     - Notion 账簿管理 (MCP 服务 + TG 指令机器人 + 价格同步器)
 #   prompts/    - AI 系统提示词
@@ -19,6 +20,7 @@ requests                # HTTP 请求（TG 推送、Tavily 新闻）
 # 📈 长桥 SDK（core/ + strategies/）
 # ──────────────────────────────────────────
 longbridge              # 长桥官方 Python SDK（行情 + 交易）
+futu-api                # 富途官方 Python SDK（期权行情）
 pandas                  # 数据处理（YahooQuery 期权降级通道需要）
 yahooquery              # 美股期权行情降级通道（长桥无权限时自动切换）
 
