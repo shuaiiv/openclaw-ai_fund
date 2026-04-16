@@ -24,6 +24,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/strate
 _ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
 sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
 sys.path.insert(0, os.path.join(_ROOT_DIR, "futu"))        # 将 futu/ 加入搜索路径
+sys.path.insert(0, os.path.join(_ROOT_DIR, "telegram"))    # 将 telegram/ 加入搜索路径
 
 # ==========================================
 # 📦 从 longbridge_server 导入封装好的函数
@@ -47,6 +48,9 @@ from futu_options_server import (
     close_context as close_futu_context,      # 释放富途 OpenD 连接
 )
 
+# 导入 TG 发送工具
+from tg_sender import send_message_async
+
 # override=True 确保覆盖系统环境中可能存在的同名旧变量
 load_dotenv(load_dotenv(), override=True)
 
@@ -57,6 +61,7 @@ load_dotenv(load_dotenv(), override=True)
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN_CLAW")
 TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+TG_GROUP_ID = os.getenv("TG_ORDER_PUSH_GROUP_ID")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))   # OpenClaw/strategies/
@@ -89,15 +94,9 @@ with open(PROMPT_FILE, "r", encoding="utf-8") as f:
 # ==========================================
 
 def tg_send(text: str):
-    """发送 Telegram 消息"""
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TG_CHAT_ID, "text": text},
-            timeout=10,
-        )
-    except Exception as e:
-        print(f"TG 发送失败: {e}")
+    """发送 Telegram 消息 (后台免阻塞)"""
+    targets = [(TG_BOT_TOKEN, cid) for cid in [TG_CHAT_ID, TG_GROUP_ID] if cid]
+    send_message_async(text, targets=targets)
 
 
 def ensure_cache_dir():

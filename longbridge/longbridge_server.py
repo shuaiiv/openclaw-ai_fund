@@ -32,20 +32,24 @@ load_dotenv(find_dotenv())
 
 
 # ==========================================
-# 📲 Telegram 推送
+# 📲 Telegram 推送 (已抽象至全局 tg_sender 模块)
 # ==========================================
 
-# 替换为你实际的 TG Bot Token 和你的 Chat ID
+_DIR = os.path.dirname(os.path.abspath(__file__))
+_ROOT = os.path.dirname(_DIR)
+if os.path.join(_ROOT, "telegram") not in sys.path:
+    sys.path.insert(0, os.path.join(_ROOT, "telegram"))
+from tg_sender import send_message_async
+
+# TG Bot Token 和 ID
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN_QUANT")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID") 
+TG_CHAT_ID = os.getenv("TG_CHAT_ID")
+TG_GROUP_ID = os.getenv("TG_ORDER_PUSH_GROUP_ID")
 
 def send_tg_notification(text):
-    """底层直连 TG 发送实时通知"""
-    try:
-        url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TG_CHAT_ID, "text": text}, timeout=5)
-    except Exception as e:
-        print(f"TG Push Failed: {e}")
+    """使用多线程异步发送，以免网络请求阻塞主交易线程"""
+    targets = [(TG_BOT_TOKEN, cid) for cid in [TG_CHAT_ID, TG_GROUP_ID] if cid]
+    send_message_async(text, targets=targets)
 
 
 # ==========================================
