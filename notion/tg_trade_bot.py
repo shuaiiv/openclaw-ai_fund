@@ -13,6 +13,8 @@ load_dotenv(find_dotenv())
 # =================配置区域=================
 # 建议通过环境变量读取，或者直接替换为字符串
 import os
+import sys
+import asyncio
 TOKEN = os.getenv("TG_BOT_TOKEN_QUANT")
 # ==========================================
 
@@ -21,6 +23,22 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     level=logging.INFO
 )
+
+import functools
+
+def restricted(func):
+    """鉴权装饰器：限制仅允许环境中的 TG_CHAT_ID 用户执行命令"""
+    @functools.wraps(func)
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        admin_id = os.getenv("TG_CHAT_ID")
+        user_id = str(update.effective_user.id) if update.effective_user else ""
+        if str(admin_id) != user_id:
+            logging.warning(f"拦截到未授权命令请求: user_id={user_id}")
+            if update.message:
+                await update.message.reply_text(f"❌ 鉴权失败: 您的账号 (ID: {user_id}) 没有权限操作该机器人。")
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapped
 
 # 1. 核心交易处理逻辑 (处理 Buy 和 Sell)
 async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
@@ -82,6 +100,7 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
         )
 
 # 2. 导出逻辑
+@restricted
 async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if len(context.args) < 2:
@@ -130,10 +149,72 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/export 美股 流水"
         )
 
-# 3. 命令注册
+# 3. 数据抓取逻辑
+@restricted
+async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if len(context.args) < 1:
+            raise ValueError("缺少参数")
+            
+        symbols = context.args
+        await update.message.reply_text(f"⏳ 正在采集 {' '.join(symbols)} 的数据，可能需要 15-30 秒，请稍候...")
+        
+        # 找到新的 fetch.py 的绝对路径
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        fetch_script = os.path.join(os.path.dirname(script_dir), "stockscope", "fetch.py")
+        
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, fetch_script, *symbols,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+        
+        if process.returncode != 0:
+             await update.message.reply_text(f"❌ 采集失败:\n{stderr.decode('utf-8')}")
+             return
+             
+        stdout_text = stdout.decode('utf-8')
+        
+        # 解析输出的文件路径
+        output_files = []
+        parsing_files = False
+        for line in stdout_text.split('\n'):
+            if "📁 全部报告：" in line:
+                parsing_files = True
+                continue
+            if parsing_files:
+                if "=" in line:
+                    parsing_files = False
+                    continue
+                line_stripped = line.strip()
+                if line_stripped:
+                    output_files.append(line_stripped)
+                
+        if not output_files:
+            await update.message.reply_text("❌ 数据采集可能已完成，但未能找到报告文件。\n相关日志：\n" + stdout_text[-1000:])
+            return
+            
+        for file_path in output_files:
+            if os.path.exists(file_path):
+                with open(file_path, 'rb') as doc:
+                    await update.message.reply_document(
+                        document=doc,
+                        filename=os.path.basename(file_path),
+                        caption=f"📊 {os.path.basename(file_path)} 行情快照采集成功！"
+                    )
+            else:
+                await update.message.reply_text(f"❌ 找不到文件: {file_path}")
+                
+    except Exception as e:
+        await update.message.reply_text(f"❌ 采集指令错误: {str(e)}\n\n💡 示例:\n/fetch AAPL.US")
+
+# 4. 命令注册
+@restricted
 async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_trade(update, context, "Buy")
 
+@restricted
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_trade(update, context, "Sell")
 
@@ -150,9 +231,10 @@ def main():
     app.add_handler(CommandHandler("buy", buy))
     app.add_handler(CommandHandler("sell", sell))
     app.add_handler(CommandHandler("export", export))
+    app.add_handler(CommandHandler("fetch", fetch))
 
     print("🚀 Command Bot 正在运行...")
-    print("✅ 已载入命令: /buy, /sell, /export")
+    print("✅ 已载入命令: /buy, /sell, /export, /fetch")
     
     # 启动机器人
     app.run_polling()
