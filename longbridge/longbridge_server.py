@@ -43,12 +43,11 @@ from tg_sender import send_message_async
 
 # TG Bot Token 和 ID
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN_QUANT")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-TG_GROUP_ID = os.getenv("TG_ORDER_PUSH_GROUP_ID")
+TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID_ORDER")
 
 def send_tg_notification(text):
     """使用多线程异步发送，以免网络请求阻塞主交易线程"""
-    targets = [(TG_BOT_TOKEN, cid) for cid in [TG_CHAT_ID, TG_GROUP_ID] if cid]
+    targets = [(TG_BOT_TOKEN, TG_CHANNEL_ID)] if TG_CHANNEL_ID else []
     send_message_async(text, targets=targets)
 
 

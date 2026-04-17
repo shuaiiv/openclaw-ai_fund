@@ -60,8 +60,7 @@ load_dotenv(load_dotenv(), override=True)
 # ==========================================
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN_CLAW")
-TG_CHAT_ID = os.getenv("TG_CHAT_ID")
-TG_GROUP_ID = os.getenv("TG_ORDER_PUSH_GROUP_ID")
+TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID_ANALYSIS")
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
 SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))   # OpenClaw/strategies/
@@ -95,7 +94,7 @@ with open(PROMPT_FILE, "r", encoding="utf-8") as f:
 
 def tg_send(text: str):
     """发送 Telegram 消息 (后台免阻塞)"""
-    targets = [(TG_BOT_TOKEN, cid) for cid in [TG_CHAT_ID, TG_GROUP_ID] if cid]
+    targets = [(TG_BOT_TOKEN, TG_CHANNEL_ID)] if TG_CHANNEL_ID else []
     send_message_async(text, targets=targets)
 
 
@@ -810,13 +809,6 @@ def handle_ai_result(symbol: str, ai_reply: str):
 
             save_plan(plan)
             print(f"✅ {symbol} 网格已更新到 daily_trading_plan.json")
-
-            # Step 10: 将 JSON 内容推送 TG
-            grid_summary = json.dumps(new_grid, ensure_ascii=False, indent=2)
-            tg_send(
-                f"📊 **【盘前网格更新】** {symbol}\n"
-                f"```\n{grid_summary}\n```"
-            )
 
         except json.JSONDecodeError as e:
             print(f"❌ AI 返回的 JSON 格式损坏: {e}")

@@ -55,8 +55,7 @@ load_dotenv(load_dotenv(), override=True)
 
 
 TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN_CLAW")
-TG_CHAT_ID    = os.getenv("TG_CHAT_ID")
-TG_GROUP_ID   = os.getenv("TG_ORDER_PUSH_GROUP_ID")
+TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID_ANALYSIS")
 _ROOT_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # OpenClaw/
 PLAN_FILE     = os.path.join(_ROOT_DIR, "data", "daily_trading_plan.json")
 CACHE_DIR     = os.path.join(_ROOT_DIR, "data", "cache")   # 与 premarket_planner 共享同一缓存目录
@@ -86,7 +85,7 @@ OPENCLAW_HEADERS = {
 
 def tg_send(text: str):
     """发送 Telegram 消息 (后台免阻塞)"""
-    targets = [(TG_BOT_TOKEN, cid) for cid in [TG_CHAT_ID, TG_GROUP_ID] if cid]
+    targets = [(TG_BOT_TOKEN, TG_CHANNEL_ID)] if TG_CHANNEL_ID else []
     send_message_async(text, targets=targets)
 
 
@@ -748,7 +747,7 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
     )
 
     # 通知老板已接管
-    tg_send(f"🤖 **【L5 全自动接管】**\n哨兵已捕获 {symbol} 警报，正在后台隐形唤醒 🦞 进行裁决...")
+    tg_send(f"🤖 **【L5 全自动接管】**\n哨兵已捕获 {symbol} 警报 ({zone_name})，现价 ${current_price}，已触及触发价 ${trigger_price}，正在后台隐形唤醒 🦞 进行裁决...")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 💥 自动接管触发: {symbol}")
 
     # 调用 AI 并处理裁决
