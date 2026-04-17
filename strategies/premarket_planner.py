@@ -902,6 +902,19 @@ def process_single_symbol(symbol: str, market: str):
             news_str=news_str,
         )
 
+        # Step 8.5: 缓存盘前所有数据，供盘中使用
+        print(f"  📝 缓存盘前数据备用...")
+        premarket_memo = {
+            "daily_kline_str": daily_kline_str,
+            "min_kline_str": min_kline_str,
+            "premarket_kline_str": premarket_kline_str,
+            "option_str": option_str,
+            "temp_str": temp_str,
+            "news_str": news_str,
+            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        write_cache(f"premarket_memo_{symbol.replace('.', '_')}.json", premarket_memo)
+
         # Step 8+9: 推送 AI
         print(f"  🤖 推送给 AI 分析...")
         tg_send(f"🤖 **【盘前谋划启动】** {symbol}\n正在唤醒 AI 策略师进行多维分析...")

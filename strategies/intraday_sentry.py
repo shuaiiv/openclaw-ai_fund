@@ -63,9 +63,13 @@ CACHE_DIR     = os.path.join(_ROOT_DIR, "data", "cache")   # 与 premarket_plann
 POLL_INTERVAL = 300  # 5分钟轮询
 
 # 🚨 系统提示词
-PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "intraday_sentry_prompt.md")
-with open(PROMPT_FILE, "r", encoding="utf-8") as f:
+PROMPT_SENTRY_FILE = os.path.join(_ROOT_DIR, "prompts", "intraday_sentry_prompt.md")
+with open(PROMPT_SENTRY_FILE, "r", encoding="utf-8") as f:
     INTRADAY_SENTRY_PROMPT = f.read()
+
+PROMPT_REBUILD_FILE = os.path.join(_ROOT_DIR, "prompts", "intraday_rebuild_prompt.md")
+with open(PROMPT_REBUILD_FILE, "r", encoding="utf-8") as f:
+    INTRADAY_REBUILD_PROMPT = f.read()
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
@@ -538,9 +542,19 @@ def build_wake_message(
     today_k_str: str,
     news_info: str,
     special_event_msg: str = "",
+    premarket_memo: dict = None,
+    is_rebuild: bool = False,
 ) -> str:
     """将所有盘面数据组装成发给 AI 的完整唤醒提示词"""
     event_header = f"🔔 **【底层系统事件注入】**: {special_event_msg}\n\n" if special_event_msg else ""
+
+    # 提取盘前缓存数据
+    pm_daily = premarket_memo.get('daily_kline_str', '暂无记录') if premarket_memo else '暂无记录'
+    pm_min10 = premarket_memo.get('min_kline_str', '暂无记录') if premarket_memo else '暂无记录'
+    pm_pre = premarket_memo.get('premarket_kline_str', '暂无记录') if premarket_memo else '暂无记录'
+    pm_opt = premarket_memo.get('option_str', '暂无记录') if premarket_memo else '暂无记录'
+    pm_temp = premarket_memo.get('temp_str', '暂无记录') if premarket_memo else '暂无记录'
+    pm_news = premarket_memo.get('news_str', '暂无记录') if premarket_memo else '暂无记录'
 
     return event_header + (
         f"🚨 **【突发盘面裁决警报】**：{symbol} 现价 ${current_price}，"
@@ -553,38 +567,26 @@ def build_wake_message(
         f"💭 **【你的盘前宏观记忆 (大局观锚点)】**：\n"
         f"> {macro_thesis}\n\n"
 
-        f"ℹ️ **【标的基本信息】**：\n{static_str}\n\n"
+        f"📚 **【二、 回顾盘前信息(战略底色)】**：\n"
+        f"ℹ️ 标的基本面：\n{static_str}\n\n"
+        f"📊 估值指标：\n{financials_str}\n\n"
+        f"📈 60日日K线与10分钟结构：\n{pm_daily}\n\n{pm_min10}\n\n"
+        f"🌅 美股盘前5分钟动能：\n{pm_pre}\n\n"
+        f"🌡️ 盘前历史温度与期权阵地：\n{pm_temp}\n\n{pm_opt}\n\n"
+        f"📰 盘前核心资讯：\n{pm_news}\n\n"
 
-        f"📊 **【估值指标】**：{financials_str}\n\n"
-
-        f"🌡️ **【市场温度】**：{temperature_str}\n\n"
-
-        f"📊 **底层实时盘面全家桶**：\n"
-        f"   - 💰 资金面：{flow_str}\n"
-        f"   - 🛡️ 衍生品：{opt_str}\n"
-
-        f"📈 **【今日 5 分钟微观全息数据 (寻觅量价信号)】**：\n"
+        f"🚨 **【三、 当日实时盘面(战术校准)】**：\n"
+        f"🌡️ 实时市场温度：{temperature_str}\n\n"
+        f"💰 实时主力资金分布：\n{flow_str}\n\n"
+        f"🛡️ 实时期权异动探针：\n{opt_str}\n\n"
+        f"📈 **【今日 5 分钟微观全息数据】**：\n"
         f"```\n{today_k_str}\n```\n\n"
-
-        f"📰 **【此时此刻最新突发资讯 (黑天鹅排雷)】**：\n"
+        f"📰 **【此时此刻最新突发资讯】**：\n"
         f"{news_info}\n\n"
 
-        f"⚠️ **【最高执行指令 (纯文本输出契约)】**：\n"
-        f"你现在的唯一任务是进行下单前的最终风控！**绝对禁止尝试调用任何外部工具！**"
-        f" 结合上方所有信息，严格按照以下两部分格式直接在回复中输出（底层系统会自动正则提取并执行）：\n\n"
-
-        f"**步骤一：动作裁决 (Action Hook)**\n"
-        f"判断突发新闻和微观 K 线是否破坏了你的【盘前宏观记忆】逻辑？资金是否够用？\n"
-        f"👉 如果逻辑成立、排雷通过且决定交易：请在一行内输出动作指令。"
-        f"格式严格为：`[ACTION: <BUY或SELL>, QTY: <计算出的股数>, PRICE: <挂单价>, REASON: <核心理由>]`\n"
-        f"   *(⚠️ 注意：加仓抄底用 BUY，触及止盈/止损线用 SELL！)*\n"
-        f"👉 如果发现基本面突变、量价形态恶劣或资金不足：果断放弃，"
-        f"输出如：`[ACTION: HOLD, REASON: 发现资金大幅流出，放弃原定抄底计划]`\n\n"
-
-        f"**步骤二：网格重铸 (JSON Update)**\n"
-        f"无论是否交易，都必须重新划定该标的的价格区间，并在回复最末尾更新网格。\n"
-        f"🛑 **红线警告**：必须且只能使用 Markdown 的 ` ```json ... ``` ` 代码块！"
-        f"你**只准**输出 {symbol} 这一只标的的局部 JSON (务必保留 status 和 macro_thesis 字段)。"
+        f"⚠️ **【要求】**：\n"
+        f"你现在的唯一任务是进行最终风控并重构阵地！**绝对禁止尝试调用任何外部工具！**\n"
+        f"请严格遵守 Prompt 中对应状态的指令输出格式！"
     )
 
 
@@ -592,7 +594,7 @@ def build_wake_message(
 # 🤖 AI 交互层
 # ===========================================================================
 
-def call_ai(wake_msg: str) -> str | None:
+def call_ai(wake_msg: str, sys_prompt: str) -> str | None:
     """
     将唤醒消息发送给本地 OpenClaw，返回 AI 回复文本，失败返回 None。
     """
@@ -603,7 +605,7 @@ def call_ai(wake_msg: str) -> str | None:
             json={
                 "model": "openclaw/default",
                 "messages": [
-                    {"role": "system", "content": INTRADAY_SENTRY_PROMPT},
+                    {"role": "system", "content": sys_prompt},
                     {"role": "user",   "content": wake_msg},
                 ],
             },
@@ -667,17 +669,20 @@ def handle_ai_verdict(symbol: str, ai_reply: str):
             time_str = dt_now.strftime("%Y-%m-%d %H:%M:%S")
 
             if symbol in new_grid_data:
-                latest_plan[symbol] = new_grid_data[symbol]
-                latest_plan[symbol]["cooldown_until"] = cooldown_until
-                # 注入或覆盖更新时间
-                latest_plan[symbol]["update_time"] = time_str
-
-                # 如果刚刚下单成功了，将这把锁烙印进 JSON
-                if traded and generated_order_id:
-                    latest_plan[symbol]["pending_order"] = {
-                        "id": generated_order_id,
-                        "time": time_str
-                    }
+                if not traded:
+                    # 如果未发生交易 (HOLD) 或属于盘中网格重构 (rebuild_prompt)，则全面吸收 AI 提供的网格
+                    latest_plan[symbol] = new_grid_data[symbol]
+                    latest_plan[symbol]["cooldown_until"] = cooldown_until
+                    latest_plan[symbol]["update_time"] = time_str
+                else:
+                    # 如果发生了真实交易 (BUY/SELL)，为防止过早画网格，只更新冷却时间并写入挂单锁
+                    latest_plan[symbol]["cooldown_until"] = cooldown_until
+                    latest_plan[symbol]["update_time"] = time_str
+                    if generated_order_id:
+                        latest_plan[symbol]["pending_order"] = {
+                            "id": generated_order_id,
+                            "time": time_str
+                        }
 
             with open(PLAN_FILE, "w", encoding="utf-8") as f:
                 json.dump(latest_plan, f, ensure_ascii=False, indent=4)
@@ -692,7 +697,7 @@ def handle_ai_verdict(symbol: str, ai_reply: str):
 # 🎯 核心触发层
 # ===========================================================================
 
-def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: str, zone_info: dict, special_event_msg: str = ""):
+def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: str, zone_info: dict, special_event_msg: str = "", is_rebuild: bool = False):
     """
     网格触线后的完整处理流程：
     收集盘面数据 → 构建唤醒词 → 调用 AI → 执行裁决
@@ -709,6 +714,10 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
     flow_str                  = fetch_capital_flow(symbol)
     today_k_str, change_pct  = fetch_kline_data(symbol, current_price)
     opt_str                   = fetch_option_snapshot(symbol, current_price)
+
+    # 读取盘前数据缓存
+    premarket_memo_file = f"premarket_memo_{symbol.replace('.', '_')}.json"
+    premarket_memo = read_cache(premarket_memo_file)
 
     # 条件触发新闻（波动超 2% 才调用，节省 Tavily API 配额；网格触线已是异动，无需再判断价格方向）
     if change_pct >= 2.0:
@@ -734,6 +743,8 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
         today_k_str=today_k_str,
         news_info=news_info,
         special_event_msg=special_event_msg,
+        premarket_memo=premarket_memo,
+        is_rebuild=is_rebuild,
     )
 
     # 通知老板已接管
@@ -741,7 +752,8 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 💥 自动接管触发: {symbol}")
 
     # 调用 AI 并处理裁决
-    ai_reply = call_ai(wake_msg)
+    sys_prompt = INTRADAY_REBUILD_PROMPT if is_rebuild else INTRADAY_SENTRY_PROMPT
+    ai_reply = call_ai(wake_msg, sys_prompt)
     if ai_reply:
         handle_ai_verdict(symbol, ai_reply)
 
@@ -976,7 +988,7 @@ def run_sentry():
                     if not hit:
                         zone_name = "强制唤醒"
                         zone_info = {"price": current_price}
-                    process_zone_hit(symbol, data, current_price, zone_name, zone_info, special_event_msg)
+                    process_zone_hit(symbol, data, current_price, zone_name, zone_info, special_event_msg, is_rebuild=force_wakeup)
 
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚨 哨兵监控遭遇异常: {e}")
