@@ -693,6 +693,32 @@ def get_order_status_by_id(order_id: str):
         print(f"⚠️ 查询订单状态异常: {e}")
         return "Error"
 
+def _logic_get_today_orders_by_symbol(symbol: str) -> list:
+    """
+    获取指定标的今日所有订单，包括所有状态。
+    每个订单包括: CODE, 方向, 价格, 数量, 状态, 创建时间, 更新时间。
+    """
+    try:
+        trade_ctx = get_trade_ctx()
+        orders_resp = trade_ctx.today_orders()
+        related_orders = []
+        if orders_resp:
+            for order in orders_resp:
+                if order.symbol == symbol or order.symbol.lstrip('0') == symbol.lstrip('0'):
+                    related_orders.append({
+                        "CODE": order.symbol,
+                        "方向": str(order.side).replace("OrderSide.", ""),
+                        "价格": str(order.price),
+                        "数量": str(getattr(order, 'quantity', getattr(order, 'submitted_quantity', 'N/A'))),
+                        "状态": str(order.status).replace("OrderStatus.", ""),
+                        "创建时间": str(getattr(order, 'submitted_at', 'N/A')),
+                        "更新时间": str(getattr(order, 'updated_at', 'N/A'))
+                    })
+        return related_orders
+    except Exception as e:
+        print(f"⚠️ 查询今日相关订单异常: {e}")
+        return []
+
 # ==========================================
 # 3. 接口层 (MCP Tools - 纯数据模式)
 # ==========================================

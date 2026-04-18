@@ -34,6 +34,7 @@ from longbridge_server import (
     submit_trade_order,                 # 下单 (内置 TG 通知)
     cancel_order_by_id,                 # 撤单
     get_order_status_by_id,             # 查询订单状态
+    _logic_get_today_orders_by_symbol,  # 查询今日标的关联订单
     _logic_get_trading_days,            # 交易日查询
     close_contexts,                     # 释放 WebSocket 连接
 )
@@ -369,6 +370,20 @@ def fetch_capital_flow(symbol: str) -> str:
     return "资金流向拉取失败"
 
 
+def fetch_today_orders(symbol: str) -> str:
+    """获取今日标的所有相关订单状态"""
+    try:
+        orders = _logic_get_today_orders_by_symbol(symbol)
+        if not orders:
+            return "今日暂无该标的之相关订单。"
+        lines = []
+        for o in orders:
+            lines.append(f"  - CODE:{o.get('CODE', 'N/A')} | 方向:{o.get('方向', 'N/A')} | 价格:{o.get('价格', 'N/A')} | 数量:{o.get('数量', 'N/A')} | 状态:{o.get('状态', 'N/A')} | 创建:{o.get('创建时间', 'N/A')} | 更新:{o.get('更新时间', 'N/A')}")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"查询今日相关订单异常: {e}"
+
+
 def fetch_kline_data(symbol: str, current_price: float) -> tuple[str, float]:
     """
     获取当天全量 5 分钟 K 线。
@@ -538,6 +553,7 @@ def build_wake_message(
     temperature_str: str,
     flow_str: str,
     opt_str: str,
+    today_orders_str: str,
     today_k_str: str,
     news_info: str,
     special_event_msg: str = "",
@@ -578,6 +594,7 @@ def build_wake_message(
         f"🌡️ 实时市场温度：{temperature_str}\n\n"
         f"💰 实时主力资金分布：\n{flow_str}\n\n"
         f"🛡️ 实时期权异动探针：\n{opt_str}\n\n"
+        f"🛒 **【今日相关订单】**：\n{today_orders_str}\n\n"
         f"📈 **【今日 5 分钟微观全息数据】**：\n"
         f"```\n{today_k_str}\n```\n\n"
         f"📰 **【此时此刻最新突发资讯】**：\n"
@@ -689,8 +706,30 @@ def handle_ai_verdict(symbol: str, ai_reply: str):
             print(f"❌ JSON 格式损坏: {e}")
 
     # 3. 推送 AI 报告
-    tg_send(f"💭 **【🦞 自动裁决报告】**\n{ai_reply}")
+    # ⚠️ ai_reply 中的 JSON 是 AI 生成的原始草稿：
+    #   - update_time 可能是 AI 猜测的错误时间
+    #   - BUY/SELL 成交时，zones 字段故意未被更新（保留旧网格等待重铸），AI 草稿与实际落盘数据不一致
+    # 正确做法：从 PLAN_FILE 中读取刚刚写入的最终状态，替换掉 ai_reply 里的 JSON 块后再推送。
+    try:
+        with open(PLAN_FILE, "r", encoding="utf-8") as f:
+            final_plan = json.load(f)
+        # 只推送当前 symbol 的最新网格，避免把全部标的都塞进消息
+        canonical_json_str = json.dumps(
+            {symbol: final_plan[symbol]}, ensure_ascii=False, indent=2
+        )
+        # 将 ai_reply 中的原始 JSON 块整体替换为落盘后的权威数据
+        tg_reply = re.sub(
+            r'```json\s*.*?\s*```',
+            f'```json\n{canonical_json_str}\n```',
+            ai_reply,
+            flags=re.DOTALL,
+        )
+    except Exception as e:
+        # 降级：文件读取失败时原样推送，至少保证消息不丢失
+        print(f"⚠️ 读取最终 PLAN_FILE 失败，降级推送原始 ai_reply: {e}")
+        tg_reply = ai_reply
 
+    tg_send(f"💭 **【🦞 自动裁决报告】 【📈 {symbol}】**\n{tg_reply}")
 
 # ===========================================================================
 # 🎯 核心触发层
@@ -713,6 +752,7 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
     flow_str                  = fetch_capital_flow(symbol)
     today_k_str, change_pct  = fetch_kline_data(symbol, current_price)
     opt_str                   = fetch_option_snapshot(symbol, current_price)
+    today_orders_str          = fetch_today_orders(symbol)
 
     # 读取盘前数据缓存
     premarket_memo_file = f"premarket_memo_{symbol.replace('.', '_')}.json"
@@ -739,6 +779,7 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
         temperature_str=temperature_str,
         flow_str=flow_str,
         opt_str=opt_str,
+        today_orders_str=today_orders_str,
         today_k_str=today_k_str,
         news_info=news_info,
         special_event_msg=special_event_msg,
@@ -940,7 +981,7 @@ def run_sentry():
             active_markets = []
             if hk_active: active_markets.append("🇭🇰港")
             if us_active: active_markets.append("🇺🇸美")
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🟢 {'/'.join(active_markets)}股盘中，执行 5 分钟例行扫描...")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🟢 {'/'.join(active_markets)}股盘中，执行 {POLL_INTERVAL // 60} 分钟例行扫描...")
 
             # 2. 读取作战计划
             plan = _load_plan()
@@ -991,8 +1032,8 @@ def run_sentry():
 
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚨 哨兵监控遭遇异常: {e}")
-            
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] ♻️ 本轮巡视结束，休眠 5 分钟...\n")
+
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] ♻️ 本轮巡视结束，休眠 {POLL_INTERVAL // 60} 分钟...\n")
 
         time.sleep(POLL_INTERVAL)
 
