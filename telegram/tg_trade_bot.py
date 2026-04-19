@@ -1,22 +1,28 @@
 import logging
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
-
-# 导入你之前写好的肌肉接口层
-import notion_database_manager 
-
-from dotenv import load_dotenv, find_dotenv
-
-# 2. ⚡️ 将 find_dotenv() 作为参数传给 load_dotenv()
-load_dotenv(find_dotenv())
-
-# =================配置区域=================
-# 建议通过环境变量读取，或者直接替换为字符串
 import os
 import sys
 import asyncio
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
+
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+
+# =================配置区域=================
 TOKEN = os.getenv("TG_BOT_TOKEN_QUANT")
+
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+FETCH_SCRIPT  = os.path.join(_SCRIPT_DIR, "../stockscope/fetch.py")
+PASSWD_SCRIPT = os.path.join(_SCRIPT_DIR, "../random_password/random_passwd.py")
+
+# 将 notion 目录加入模块搜索路径，以便导入 notion_database_manager
+_NOTION_DIR = os.path.normpath(os.path.join(_SCRIPT_DIR, "../notion"))
+if _NOTION_DIR not in sys.path:
+    sys.path.insert(0, _NOTION_DIR)
 # ==========================================
+
+# 导入肌肉接口层
+import notion_database_manager
 
 # 设置日志，方便在 systemd 中查看报错
 logging.basicConfig(
@@ -159,12 +165,8 @@ async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         symbols = context.args
         await update.message.reply_text(f"⏳ 正在采集 {' '.join(symbols)} 的数据，可能需要 15-30 秒，请稍候...")
         
-        # 找到新的 fetch.py 的绝对路径
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        fetch_script = os.path.join(os.path.dirname(script_dir), "stockscope", "fetch.py")
-        
         process = await asyncio.create_subprocess_exec(
-            sys.executable, fetch_script, *symbols,
+            sys.executable, FETCH_SCRIPT, *symbols,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
@@ -218,6 +220,66 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_trade(update, context, "Sell")
 
+# 5. 密码生成逻辑
+@restricted
+async def passwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # 最多接受 5 个参数，透传给 random_passwd.py
+        args = context.args[:5] if context.args else []
+
+        process = await asyncio.create_subprocess_exec(
+            sys.executable, PASSWD_SCRIPT, *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await process.communicate()
+
+        if process.returncode != 0:
+            err = stderr.decode("utf-8").strip()
+            await update.message.reply_text(f"❌ 生成失败:\n{err}")
+            return
+
+        output = stdout.decode("utf-8").strip()
+
+        # 从输出中拆分 "生成的密码: XXXX" 那一行
+        password = None
+        info_lines = []
+        for line in output.splitlines():
+            if line.startswith("生成的密码:"):
+                password = line.replace("生成的密码:", "").strip()
+            else:
+                info_lines.append(line)
+
+        if not password:
+            await update.message.reply_text(f"❌ 未能解析到密码内容:\n{output}")
+            return
+
+        info_text = "\n".join(info_lines)
+        # 密码使用 Spoiler 隐藏（MarkdownV2 格式）
+        escaped_info = info_text.replace(".", "\\.").replace("-", "\\-").replace("(", "\\(").replace(")", "\\)").replace("!", "\\!").replace("+", "\\+").replace("=", "\\=")
+        escaped_pwd  = "".join(
+            f"\\{c}" if c in r"\_*[]()~`>#+-=|{}.!" else c
+            for c in password
+        )
+
+        reply = (
+            f"🔐 *密码已生成*\n"
+            f"{escaped_info}\n"
+            f"密码: ||{escaped_pwd}||"
+        )
+        await update.message.reply_text(reply, parse_mode="MarkdownV2")
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ 指令错误: {str(e)}\n\n"
+            "💡 用法:\n"
+            "/passwd \\[长度] \\[大写0/1] \\[小写0/1] \\[数字0/1] \\[符号0/1或符号列表]\n\n"
+            "示例:\n"
+            "/passwd          → 默认20位\n"
+            "/passwd 32       → 32位\n"
+            "/passwd 16 1 1 1 ~!@#$  → 指定符号"
+        )
+
 # 主程序
 def main():
     if TOKEN == "你的_NEW_BOT_TOKEN_HERE":
@@ -232,9 +294,10 @@ def main():
     app.add_handler(CommandHandler("sell", sell))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("fetch", fetch))
+    app.add_handler(CommandHandler("passwd", passwd))
 
     print("🚀 Command Bot 正在运行...")
-    print("✅ 已载入命令: /buy, /sell, /export, /fetch")
+    print("✅ 已载入命令: /buy, /sell, /export, /fetch, /passwd")
     
     # 启动机器人
     app.run_polling()
