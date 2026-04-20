@@ -76,7 +76,7 @@ _DATA_CACHE = {}
 
 # K 线周期字符串 → SDK 枚举映射（全局唯一定义，避免各工具函数重复声明）
 PERIOD_MAP = {
-    "1min": Period.Min_1, "5min": Period.Min_5, "15min": Period.Min_15,
+    "1min": Period.Min_1, "5min": Period.Min_5, "10min": Period.Min_10, "15min": Period.Min_15,
     "30min": Period.Min_30, "60min": Period.Min_60,
     "day": Period.Day, "week": Period.Week, "month": Period.Month, "year": Period.Year
 }
@@ -809,7 +809,7 @@ def get_history_candlesticks(symbol: str, period: str = "day", start: str = None
 
     参数:
     - symbol: 股票代码 (e.g., "0700.HK")
-    - period: 周期，可选值 "1min", "5min", "15min", "30min", "60min", "day" (日K), "week" (周K), "month" (月K), "year" (年K)。默认为 "day"。
+    - period: 周期，可选值 "1min", "5min", "10min", "15min", "30min", "60min", "day" (日K), "week" (周K), "month" (月K), "year" (年K)。默认为 "day"。
     - start: 开始日期 (格式 "YYYY-MM-DD")。
     - end: 结束日期 (格式 "YYYY-MM-DD")。
     """

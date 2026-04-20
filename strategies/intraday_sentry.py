@@ -6,7 +6,7 @@ import re
 import requests
 from datetime import datetime, timedelta
 import pytz
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from longbridge.openapi import Period, Market
 
 # ==========================================================
@@ -52,12 +52,15 @@ from tg_sender import send_message_async
 
 
 # override=True 确保覆盖系统环境中可能存在的同名旧变量
-load_dotenv(load_dotenv(), override=True)
+load_dotenv(find_dotenv(), override=True)
 
 
-TG_BOT_TOKEN  = os.getenv("TG_BOT_TOKEN_CLAW")
-TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID_ANALYSIS")
-_ROOT_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # OpenClaw/
+TG_BOT_TOKEN         = os.getenv("TG_BOT_TOKEN_CLAW")
+TG_CHANNEL_ANALYSIS  = os.getenv("TG_CHANNEL_ID_ANALYSIS")
+TG_CHANNEL_ORDER     = os.getenv("TG_CHANNEL_ID_ORDER")
+# 已完备：old 变量保留向下兼容
+TG_CHANNEL_ID        = TG_CHANNEL_ANALYSIS
+
 PLAN_FILE     = os.path.join(_ROOT_DIR, "data", "daily_trading_plan.json")
 CACHE_DIR     = os.path.join(_ROOT_DIR, "data", "cache")   # 与 premarket_planner 共享同一缓存目录
 POLL_INTERVAL = 300  # 5分钟轮询
@@ -84,10 +87,21 @@ OPENCLAW_HEADERS = {
 # 🛠️ 工具函数层
 # ===========================================================================
 
-def tg_send(text: str):
-    """发送 Telegram 消息 (后台免阻塞)"""
-    targets = [(TG_BOT_TOKEN, TG_CHANNEL_ID)] if TG_CHANNEL_ID else []
+def tg_analysis(text: str):
+    """发往 Analysis 频道（AI报告、盘前分析、系统状态）"""
+    targets = [(TG_BOT_TOKEN, TG_CHANNEL_ANALYSIS)] if TG_CHANNEL_ANALYSIS else []
     send_message_async(text, targets=targets)
+
+
+def tg_order(text: str):
+    """发往 Order 频道（订单成交/撒单/告警）"""
+    targets = [(TG_BOT_TOKEN, TG_CHANNEL_ORDER)] if TG_CHANNEL_ORDER else []
+    send_message_async(text, targets=targets)
+
+
+def tg_send(text: str):
+    """兼容旧代码：默认发往 Analysis 频道"""
+    tg_analysis(text)
 
 
 def _ensure_cache_dir():
@@ -150,7 +164,7 @@ _US_TZ = "America/New_York"
 
 # 交易时段定义（每个元素: ((start_h, start_m), (end_h, end_m))）
 _HK_SESSIONS = [((9, 30), (12, 0)), ((13, 0), (16, 0))]   # 港股 上午+下午
-_US_SESSIONS = [((9, 30), (16, 0)), ((16, 0), (20, 0))]   # 美股 盘中 + 盘后
+_US_SESSIONS = [((9, 30), (15, 59)), ((16, 0), (20, 0))]   # 美股 盘中(09:30-15:59) + 盘后(16:00-20:00)
 
 # 交易日缓存（每日只查询一次 API）
 _trading_day_cache: dict = {"date": None, "hk": None, "us": None}
@@ -241,10 +255,18 @@ def _get_market_status() -> tuple[bool, bool, int]:
 # 📡 数据采集层（每个函数只做一件事）
 # ===========================================================================
 
-def fetch_account_status(symbol: str) -> tuple[str, str, float]:
+def fetch_account_status(symbol: str) -> tuple[str, str, float, str]:
     """
-    获取账户购买力与指定标的持仓。
-    返回: (money_str, pos_str, buying_power)
+    获取账户购买力与持仓信息，计算同市场仓位占比。
+
+    返回: (money_str, pos_str, buying_power, all_positions_str)
+      - money_str        : 当前市场货币的现金与购买力一行摘要
+      - pos_str          : 当前标的持仓简述（空仓/已持仓 N 股）
+      - buying_power     : 最大购买力浮点数（用于资金判断）
+      - all_positions_str: 含已算好的仓位占比，供 AI 直接参考
+
+    仓位占比公式：当前标的市值 ÷ (同市场所有持仓市值合计 + 同市场现金余额)
+    分母用"现金"，不含融资授信，反映真实风险暴露。
     """
     try:
         asset = get_account_asset()
@@ -253,21 +275,100 @@ def fetch_account_status(symbol: str) -> tuple[str, str, float]:
         positions = asset.get("positions", [])
 
         target_currency = "USD" if symbol.upper().endswith(".US") else "HKD"
-        cash_val = cash_info.get(target_currency, "0")
+        target_market   = "US"  if symbol.upper().endswith(".US") else "HK"
+        cash_val_str    = cash_info.get(target_currency, "0")
+        try:
+            cash_val = float(str(cash_val_str).replace(",", ""))
+        except (ValueError, TypeError):
+            cash_val = 0.0
 
+        # ── 当前标的持仓（精确查找） ──────────────────────────────────────
         real_qty, real_cost = 0, 0.0
+        current_mkt_val = 0.0
         for p in positions:
             p_sym = p.get("symbol", "")
             if p_sym == symbol or p_sym.lstrip('0') == symbol.lstrip('0'):
-                real_qty = int(float(p.get("available_qty", 0)))
+                real_qty  = int(float(p.get("available_qty", 0)))
                 real_cost = float(p.get("cost_price", 0.0))
+                # 当前标的市值：优先用 market_value，fallback 用 qty×cost
+                mkt_raw = p.get("market_value")
+                try:
+                    current_mkt_val = float(str(mkt_raw).replace(",", ""))
+                except (ValueError, TypeError, AttributeError):
+                    current_mkt_val = real_qty * real_cost
 
-        pos_str = f"已持仓 {real_qty} 股 (成本价 ${real_cost:.2f})" if real_qty > 0 else "0 股 (空仓)"
-        money_str = f"💵 可用现金({target_currency}): ${cash_val} | 💳 最大购买力: ${buying_power:.2f}"
-        return money_str, pos_str, buying_power
+        pos_str   = f"已持仓 {real_qty} 股 (成本价 ${real_cost:.2f})" if real_qty > 0 else "0 股 (空仓)"
+        money_str = f"💵 可用现金({target_currency}): ${cash_val_str} | 💳 最大购买力: ${buying_power:.2f}"
+
+        # ── 同市场所有持仓及市值 ─────────────────────────────────────────
+        same_mkt_positions = []
+        for p in positions:
+            sym = p.get("symbol", "")
+            is_same = (target_market == "HK" and sym.endswith(".HK")) or \
+                      (target_market == "US" and sym.endswith(".US"))
+            if not is_same:
+                continue
+            mkt_raw = p.get("market_value")
+            try:
+                mval = float(str(mkt_raw).replace(",", ""))
+            except (ValueError, TypeError, AttributeError):
+                qty  = float(p.get("available_qty", 0) or 0)
+                cost = float(p.get("cost_price", 0)   or 0)
+                mval = qty * cost  # fallback
+            same_mkt_positions.append({**p, "_mkt_val": mval})
+
+        total_holding_val = sum(p["_mkt_val"] for p in same_mkt_positions)
+        nav = total_holding_val + cash_val   # 同市场净资产（分母）
+        using_estimate = any(
+            p.get("market_value") in (None, "N/A", "") for p in positions
+        )
+        nav_note = "⚠️市值使用成本估算" if using_estimate else "实时市值"
+
+        # ── 组装 all_positions_str ─────────────────────────────────────────
+        # 行1：同市场净资产概览
+        lines = [
+            f"📊 {target_currency} 市场净资产: ${nav:,.0f}"
+            f" = 持仓市值 ${total_holding_val:,.0f} + 现金 ${cash_val:,.0f}  [{nav_note}]",
+        ]
+
+        # 行2：计算公式红线提醒
+        if real_qty > 0 and nav > 0:
+            cur_ratio = current_mkt_val / nav * 100
+            warn = " ⚠️接近55%上限" if cur_ratio >= 45 else (" 🚨已超55%上限！禁止买入！" if cur_ratio >= 55 else "")
+            lines.append(
+                f"🎯 {symbol} 实时仓位占比: {cur_ratio:.1f}%"
+                f" ({target_currency}${current_mkt_val:,.0f} ÷ ${nav:,.0f}){warn}"
+            )
+        else:
+            lines.append(f"🎯 {symbol} 当前空仓，占比 0%")
+
+        # 行3：同市场所有持仓明细
+        lines.append(f"{'─'*36}")
+        lines.append("📦 同市场全部持仓:")
+        if same_mkt_positions:
+            for p in same_mkt_positions:
+                sym   = p.get("symbol", "N/A")
+                qty   = p.get("available_qty", 0)
+                cost  = p.get("cost_price", 0)
+                mval  = p["_mkt_val"]
+                ratio = (mval / nav * 100) if nav > 0 else 0
+                warn  = " ⚠️" if ratio >= 45 else (" 🚨" if ratio >= 55 else "")
+                lines.append(
+                    f"  {sym}: {qty}股 | 成本${cost} | 市值${mval:,.0f} | 占比{ratio:.1f}%{warn}"
+                )
+        else:
+            lines.append(f"  {target_currency} 市场当前全部空仓")
+
+        # 行4：其他市场现金快照（简要）
+        lines.append(f"{'─'*36}")
+        cash_summary = " | ".join([f"{cur}: ${val}" for cur, val in cash_info.items()])
+        lines.append(f"💰 账户现金快照: {cash_summary}")
+
+        all_positions_str = "\n".join(lines)
+        return money_str, pos_str, buying_power, all_positions_str
     except Exception as e:
         print(f"⚠️ 账户状态获取失败: {e}")
-        return "0.00 (获取异常，限制买入)", "获取异常", 0.0
+        return "0.00 (获取异常，限制买入)", "获取异常", 0.0, "持仓总览获取失败"
 
 
 # ===========================================================================
@@ -455,20 +556,26 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
 
         days_to_friday = (4 - today.weekday()) % 7 or 7
         this_friday    = today + timedelta(days=days_to_friday)
-        two_weeks_out  = today + timedelta(days=14)
+
+        # 自适应中期到期日：
+        #   如果距本周五 <=3 天（周三/周四/周五），选"下下周末"，避免前两个日期太贴近
+        #   否则（周一/周二）选"下周末"
+        next_weeks = 2 if days_to_friday <= 3 else 1
+        middle_friday  = today + timedelta(days=days_to_friday + next_weeks * 7)
         four_weeks_out = today + timedelta(days=28)
 
         def pick_closest(dates, target):
             return min(dates, key=lambda d: abs((d - target).days))
 
         near_date       = pick_closest(future_dates, this_friday)
-        two_week_date   = pick_closest(future_dates, two_weeks_out)
+        middle_date     = pick_closest(future_dates, middle_friday)
         four_week_date  = pick_closest(future_dates, four_weeks_out)
+        middle_label    = "下周末" if next_weeks == 1 else "下下周末"
 
         # 去重：三个目标日期可能重合
         seen = set()
         targets = []
-        for d, label in [(near_date, "本周末"), (two_week_date, "两周后"), (four_week_date, "四周后")]:
+        for d, label in [(near_date, "本周末"), (middle_date, middle_label), (four_week_date, "四周后")]:
             if d not in seen:
                 seen.add(d)
                 targets.append((d, label))
@@ -548,6 +655,7 @@ def build_wake_message(
     macro_thesis: str,
     money_str: str,
     pos_str: str,
+    all_positions_str: str,
     static_str: str,
     financials_str: str,
     temperature_str: str,
@@ -575,9 +683,11 @@ def build_wake_message(
         f"🚨 **【突发盘面裁决警报】**：{symbol} 现价 ${current_price}，"
         f"已触击网格【{zone_name}】(触发价 ${trigger_price})！\n\n"
 
-        f"🏦 **【当前账户真实火力状态】** (⚠️ 裁决前必须过资金这关！)：\n"
+        f"🏦 **【一、当前账户真实火力状态】** (⚠️ 裁决前必须过资金这关！)\n"
         f"   - 💵 {money_str}\n"
-        f"   - 📦 {pos_str}\n\n"
+        f"   - 📦 **{symbol} 当前持仓**: {pos_str}\n\n"
+        f"   **其他标的持仓总览** (⚠️ 评估 55% 仓位上限时必须参考)：\n"
+        f"{all_positions_str}\n\n"
 
         f"💭 **【你的盘前宏观记忆 (大局观锚点)】**：\n"
         f"> {macro_thesis}\n\n"
@@ -705,11 +815,7 @@ def handle_ai_verdict(symbol: str, ai_reply: str):
         except json.JSONDecodeError as e:
             print(f"❌ JSON 格式损坏: {e}")
 
-    # 3. 推送 AI 报告
-    # ⚠️ ai_reply 中的 JSON 是 AI 生成的原始草稿：
-    #   - update_time 可能是 AI 猜测的错误时间
-    #   - BUY/SELL 成交时，zones 字段故意未被更新（保留旧网格等待重铸），AI 草稿与实际落盘数据不一致
-    # 正确做法：从 PLAN_FILE 中读取刚刚写入的最终状态，替换掉 ai_reply 里的 JSON 块后再推送。
+    tg_reply = ai_reply  # 默认 fallback
     try:
         with open(PLAN_FILE, "r", encoding="utf-8") as f:
             final_plan = json.load(f)
@@ -727,9 +833,20 @@ def handle_ai_verdict(symbol: str, ai_reply: str):
     except Exception as e:
         # 降级：文件读取失败时原样推送，至少保证消息不丢失
         print(f"⚠️ 读取最终 PLAN_FILE 失败，降级推送原始 ai_reply: {e}")
-        tg_reply = ai_reply
 
-    tg_send(f"💭 **【🦞 自动裁决报告】 【📈 {symbol}】**\n{tg_reply}")
+    # 标题根据裁决动作类型动态生成
+    if action_match:
+        action_type = action_match.group(1)
+        if action_type == "BUY":
+            verdict_label = f"🟢 裁决：买入 (BUY)"
+        elif action_type == "SELL":
+            verdict_label = f"🔴 裁决：卖出 (SELL)"
+        else:
+            verdict_label = f"⏸️ 裁决：观望 (HOLD)"
+    else:
+        verdict_label = "🦞 自动裁决"
+
+    tg_analysis(f"💭 **【{verdict_label}】 【📈 {symbol}】**\n{tg_reply}")
 
 # ===========================================================================
 # 🎯 核心触发层
@@ -745,7 +862,7 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
 
     # 各维度数据采集（独立函数，各自 try/except）
     macro_thesis              = data.get("macro_thesis", "未配置盘前宏观剧本，请仅依赖短期盘面判断。")
-    money_str, pos_str, _    = fetch_account_status(symbol)
+    money_str, pos_str, _, all_positions_str = fetch_account_status(symbol)
     static_str               = fetch_static_info(symbol)
     financials_str           = fetch_financial_indexes(symbol)
     temperature_str          = fetch_market_temperature(symbol)
@@ -758,8 +875,13 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
     premarket_memo_file = f"premarket_memo_{symbol.replace('.', '_')}.json"
     premarket_memo = read_cache(premarket_memo_file)
 
-    # 条件触发新闻（波动超 2% 才调用，节省 Tavily API 配额；网格触线已是异动，无需再判断价格方向）
-    if change_pct >= 2.0:
+    # 新闻触发策略：
+    # - rebuild 场景（订单状态变更唤醒）：无条件拉取，确保 AI 掌握最新信息
+    # - 普通网格触及场景：波动超 2% 时才调用，节省 Tavily API 配额
+    if is_rebuild:
+        print(f"📰 {symbol} rebuild 场景，无条件触发 Tavily 新闻搜索...")
+        news_info = fetch_latest_news(symbol)
+    elif change_pct >= 2.0:
         print(f"🚨 {symbol} 日内波动 {change_pct:.1f}% 达标，触发 Tavily 新闻搜索...")
         news_info = fetch_latest_news(symbol)
     else:
@@ -774,6 +896,7 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
         macro_thesis=macro_thesis,
         money_str=money_str,
         pos_str=pos_str,
+        all_positions_str=all_positions_str,
         static_str=static_str,
         financials_str=financials_str,
         temperature_str=temperature_str,
@@ -787,8 +910,8 @@ def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: s
         is_rebuild=is_rebuild,
     )
 
-    # 通知老板已接管
-    tg_send(f"🤖 **【L5 全自动接管】**\n哨兵已捕获 {symbol} 警报 ({zone_name})，现价 ${current_price}，已触及触发价 ${trigger_price}，正在后台隐形唤醒 🦞 进行裁决...")
+    # 通知已接管（发往 Analysis 频道）
+    tg_analysis(f"🤖 **【L5 全自动接管】**\n哨兵已捕获 {symbol} 警报 ({zone_name})，现价 ${current_price}，已触及触发价 ${trigger_price}，正在后台隐形唤醒 🦞 进行裁决...")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 💥 自动接管触发: {symbol}")
 
     # 调用 AI 并处理裁决
@@ -892,10 +1015,10 @@ def _check_pending_order(symbol: str, data: dict, plan: dict) -> tuple[bool, str
             cancel_result = cancel_order_by_id(order_id)
 
             if cancel_result and "error" in cancel_result:
-                tg_send(f"🆘 **【撤单失败警报】**\n标的: {symbol}\n原因: {cancel_result['error']}\n⚠️ 请手动处理！")
+                tg_order(f"🆘 **【撤单失败警报】**\n标的: {symbol}\n原因: {cancel_result['error']}\n⚠️ 请手动处理！")
                 return False, "", True  # 保持锁定，等下一轮重试
 
-            tg_send(f"⚠️ **【战术撤单】**\n标的: {symbol}\n原因: 挂单超时未成交，已由哨兵自动撤单以释放资金。")
+            tg_order(f"⚠️ **【战术撤单】**\n标的: {symbol}\n原因: 挂单超时15分钟未成交，已由哨兵自动撤单以释放资金。")
             force_wakeup = True
             special_event_msg = "⚠️ 【系统强制事件：超时撤单】你之前的挂单因价格偏离已超时被系统撤销。资金已释放，请根据当前最新盘面重新进行动作裁决！"
             del data["pending_order"]
@@ -907,7 +1030,7 @@ def _check_pending_order(symbol: str, data: dict, plan: dict) -> tuple[bool, str
     elif order_status == _FILLED_STATUS:
         # 完全成交 → 强制唤醒重铸网格
         print(f"✅ {symbol} 挂单 [{order_id}] 已完全成交！")
-        tg_send(f"🎉 **【订单成交捷报】**\n标的: {symbol}\n状态: 完全成交 (Filled)\n下一步: 正在唤醒大脑重铸网格...")
+        tg_order(f"🎉 **【订单成交捷报】**\n标的: {symbol}\n状态: 完全成交 (Filled)\n下一步: 正在唤醒大脑重铸网格...")
         force_wakeup = True
         special_event_msg = "🎉 【系统强制事件：订单成交】你上一笔订单已完全成交！当前底牌已变，请根据最新资金和仓位更新 status 并重铸网格！⚠️警告：本次唤醒纯为了更新网格以配合新仓位。你必须严格输出 [ACTION: HOLD, REASON: 订单成交重铸网格]，绝对禁止在成交后立刻再次下单！"
         del data["pending_order"]
@@ -922,7 +1045,7 @@ def _check_pending_order(symbol: str, data: dict, plan: dict) -> tuple[bool, str
     else:
         msg = f"🆘 **【未知订单状态告警】**\n标的: {symbol}\n状态: {order_status}\n⚠️ 请立即核对长桥文档！"
         print(msg)
-        tg_send(msg)
+        tg_order(msg)
         return False, "", True  # should_skip = True, 不敢乱动，锁住等人类介入
 
     # 发生了状态流转（锁被拆掉）→ 立即持久化，清除硬盘上的 pending_order 痕迹
@@ -942,12 +1065,38 @@ def _check_zone_hit(data: dict, current_price: float) -> tuple[bool, str, dict]:
       - zone_name : 命中的网格名称（未命中时为空字符串）
       - zone_info : 命中的网格详情 dict（未命中时为空 dict）
     """
-    for z_name, z_info in list(data.get("zones", {}).items()):
-        trigger_price = float(z_info["price"])
-        cond = z_info["condition"]
-        if (cond == "<=" and current_price <= trigger_price) or \
-           (cond == ">=" and current_price >= trigger_price):
-            return True, z_name, z_info
+    # 优先级排序：止损 > 止盈 > 买入类
+    # 防止极端行情下价格同时触及止损和买入区间时，错误触发加仓而非止损
+    PRIORITY_ORDER = ["stop_loss", "take_profit", "add_position", "buy_oversold", "buy_dip", "buy_breakout"]
+
+    zones = data.get("zones", {})
+    # 先按优先级检查已知类型
+    for z_name in PRIORITY_ORDER:
+        if z_name not in zones:
+            continue
+        z_info = zones[z_name]
+        try:
+            trigger_price = float(z_info["price"])
+            cond = z_info["condition"]
+            if (cond == "<=" and current_price <= trigger_price) or \
+               (cond == ">=" and current_price >= trigger_price):
+                return True, z_name, z_info
+        except (KeyError, ValueError, TypeError):
+            continue
+
+    # 再检查未在优先级列表中的自定义 zone（如 tp_1, tp_2 等）
+    for z_name, z_info in zones.items():
+        if z_name in PRIORITY_ORDER:
+            continue  # 已检查过
+        try:
+            trigger_price = float(z_info["price"])
+            cond = z_info["condition"]
+            if (cond == "<=" and current_price <= trigger_price) or \
+               (cond == ">=" and current_price >= trigger_price):
+                return True, z_name, z_info
+        except (KeyError, ValueError, TypeError):
+            continue
+
     return False, "", {}
 
 

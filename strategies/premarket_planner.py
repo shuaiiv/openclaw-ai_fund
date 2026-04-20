@@ -13,7 +13,7 @@ import requests
 import schedule
 from datetime import datetime, timedelta, date
 import pytz
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from longbridge.openapi import Period, Market
 
 # ==========================================================
@@ -52,7 +52,7 @@ from futu_options_server import (
 from tg_sender import send_message_async
 
 # override=True 确保覆盖系统环境中可能存在的同名旧变量
-load_dotenv(load_dotenv(), override=True)
+load_dotenv(find_dotenv(), override=True)
 
 
 # ==========================================
@@ -159,7 +159,13 @@ def is_trading_day(market: str) -> bool:
 # ==========================================
 
 def fetch_account_status(market: str) -> str:
-    """获取账户购买力与全部持仓，返回可读文本。"""
+    """
+    获取账户购买力与全部持仓，计算各标的仓位占比并返回可读文本。
+
+    仓位占比公式：
+        当前标的市值 ÷ (同市场所有持仓市值合计 + 同市场现金余额)
+    分母使用"现金"而非"购买力"，不含融资授信，反映真实风险暴露。
+    """
     try:
         asset = get_account_asset()
         buying_power = asset.get("buy_power", "0")
@@ -167,17 +173,75 @@ def fetch_account_status(market: str) -> str:
         positions = asset.get("positions", [])
 
         target_currency = "HKD" if market == "HK" else "USD"
-        cash_val = cash_info.get(target_currency, "0")
+        cash_val_str = cash_info.get(target_currency, "0")
+        try:
+            cash_val = float(str(cash_val_str).replace(",", ""))
+        except (ValueError, TypeError):
+            cash_val = 0.0
 
-        lines = [f"💵 可用现金({target_currency}): ${cash_val} | 💳 最大购买力(含融资): ${buying_power}"]
-        if positions:
-            for p in positions:
+        # ── 筛选同市场持仓，计算每只标的的市值 ──────────────────────────
+        same_market_positions = []
+        for p in positions:
+            sym = p.get("symbol", "")
+            is_same = (market == "HK" and sym.endswith(".HK")) or \
+                      (market == "US" and sym.endswith(".US"))
+            if not is_same:
+                continue
+
+            # 优先用实时市值，fallback 用 available_qty × cost_price（成本估算）
+            mkt_raw = p.get("market_value")
+            try:
+                mkt_val = float(str(mkt_raw).replace(",", ""))
+            except (ValueError, TypeError, AttributeError):
+                qty  = float(p.get("available_qty", 0) or 0)
+                cost = float(p.get("cost_price", 0) or 0)
+                mkt_val = qty * cost  # fallback 估算
+
+            same_market_positions.append({
+                **p,
+                "_mkt_val": mkt_val,
+            })
+
+        # ── 计算同市场净资产（分母）───────────────────────────────────────
+        total_holding_val = sum(p["_mkt_val"] for p in same_market_positions)
+        nav = total_holding_val + cash_val  # 净资产 = 持仓市值 + 现金
+
+        # ── 组装输出文本 ──────────────────────────────────────────────────
+        mkt_val_src = "⚠️(成本估算)" if any(
+            p.get("market_value") in (None, "N/A", "") for p in positions
+        ) else "实时"
+
+        lines = [
+            f"💵 可用现金({target_currency}): ${cash_val_str} | 💳 最大购买力(含融资): ${buying_power}",
+            f"📊 {target_currency} 市场净资产: ${nav:,.0f} (持仓市值 ${total_holding_val:,.0f} + 现金 ${cash_val:,.0f}) [{mkt_val_src}]",
+            f"{'='*40}",
+        ]
+
+        if same_market_positions:
+            for p in same_market_positions:
+                sym   = p.get("symbol", "N/A")
+                qty   = p.get("available_qty", 0)
+                cost  = p.get("cost_price", 0)
+                cur   = p.get("currency", target_currency)
+                mval  = p["_mkt_val"]
+                ratio = (mval / nav * 100) if nav > 0 else 0
+                warn  = " ⚠️接近上限" if ratio >= 45 else (" 🚨超限" if ratio >= 55 else "")
                 lines.append(
-                    f"  📦 {p['symbol']}: {p['qty']}股 (可用{p['available_qty']}股, "
-                    f"成本${p['cost_price']}, 币种{p['currency']})"
+                    f"  📦 {sym}: {qty}股 | 成本{cur}${cost} | 市值${mval:,.0f}"
+                    f" | **占比 {ratio:.1f}%**{warn}"
                 )
         else:
-            lines.append("  📦 当前空仓")
+            lines.append(f"  📦 {target_currency} 市场当前空仓")
+
+        # 其他市场持仓简要附上
+        other = [p for p in positions if p not in same_market_positions
+                 and p.get("symbol", "") not in [q.get("symbol", "") for q in same_market_positions]]
+        if other:
+            lines.append(f"{'='*40}")
+            lines.append("🌐 其他市场持仓（参考）:")
+            for p in other:
+                lines.append(f"  {p.get('symbol')}: {p.get('available_qty')}股 成本${p.get('cost_price')}")
+
         return "\n".join(lines)
     except Exception as e:
         return f"账户状态获取失败: {e}"
@@ -562,9 +626,15 @@ def fetch_option_data(symbol: str, current_price: float = 0) -> str:
             return "该标的暂无未来期权到期日。"
 
         # 计算目标到期日
+        # 今天 days_to_friday：到本周五的天数（最少 1 天）
         days_to_friday = (4 - today.weekday()) % 7 or 7
         this_friday    = today + timedelta(days=days_to_friday)
-        two_weeks_out  = today + timedelta(days=14)
+
+        # 自适应中期到期日：
+        #   如果距本周五 <=3 天（周三/周四/周五），则选“下下周末”，避免前两个日期太贴近
+        #   否则（周一/周二）选“下周末”
+        next_weeks = 2 if days_to_friday <= 3 else 1
+        middle_friday  = today + timedelta(days=days_to_friday + next_weeks * 7)
         four_weeks_out = today + timedelta(days=28)
 
         def pick_closest(dates, target):
@@ -573,7 +643,7 @@ def fetch_option_data(symbol: str, current_price: float = 0) -> str:
         # 三个目标到期日
         target_dates = [
             (pick_closest(future_dates, this_friday),    "本周末"),
-            (pick_closest(future_dates, two_weeks_out),  "两周后"),
+            (pick_closest(future_dates, middle_friday),  "下周末" if next_weeks == 1 else "下下周末"),
             (pick_closest(future_dates, four_weeks_out), "四周后"),
         ]
         seen = set()
@@ -817,14 +887,15 @@ def handle_ai_result(symbol: str, ai_reply: str):
         print(f"⚠️ AI 未返回 JSON 代码块")
         tg_send(f"⚠️ {symbol} 盘前谋划 AI 未返回网格 JSON")
 
-    # 2. 推送 AI 分析报告 (由于 TG 单条消息限制 4096 字符，若超过则分段发送)
+    # 2. 推送 AI 分析报告
     prefix = f"💭 **【盘前策略报告】** {symbol}\n"
-    max_len = 4000
-    if len(ai_reply) + len(prefix) <= 4096:
+    max_safe = 4000  # 内容最大字符数（含前缀不超过 4096）
+    if len(prefix) + len(ai_reply) <= max_safe:
         tg_send(prefix + ai_reply)
     else:
-        # 分段发送
-        chunks = [ai_reply[i:i+max_len] for i in range(0, len(ai_reply), max_len)]
+        # 分段发送，每次确保 prefix + chunk 不超过 max_safe
+        chunk_size = max_safe - len(prefix)
+        chunks = [ai_reply[i:i+chunk_size] for i in range(0, len(ai_reply), chunk_size)]
         for i, chunk in enumerate(chunks):
             header = prefix if i == 0 else f"💭 **【盘前策略报告】** {symbol} (续 {i+1})\n"
             tg_send(header + chunk)
@@ -834,7 +905,7 @@ def handle_ai_result(symbol: str, ai_reply: str):
 # 🎯 单标的完整处理流程
 # ==========================================
 
-def process_single_symbol(symbol: str, market: str):
+def process_single_symbol(symbol: str, market: str, market_name: str):
     """对单个标的执行完整的盘前分析流程"""
     print(f"\n{'='*60}")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🎯 开始分析: {symbol}")
@@ -870,12 +941,12 @@ def process_single_symbol(symbol: str, market: str):
             premarket_kline_str = fetch_premarket_kline_us(symbol)
 
         # Step 6: 期权数据
-        print(f"  📡 Step 6/7: 获取期权数据...")
+        print(f"  📡 Step 6/8: 获取期权数据...")
         # 富途 API 支持港股和美股期权，统一调用；内部已有完整容错
         option_str = fetch_option_data(symbol)
 
         # Step 7: 最新资讯
-        print(f"  📡 Step 7/7: 获取最新资讯...")
+        print(f"  📡 Step 7/8: 获取最新资讯...")
         news_str = fetch_latest_news(symbol)
 
         # Step 8: 组装消息
@@ -895,21 +966,22 @@ def process_single_symbol(symbol: str, market: str):
         )
 
         # Step 8.5: 缓存盘前所有数据，供盘中使用
+        # 注意: 缓存的数据但作“盘前快照”战略参考，盘中实时数据将实斗岖新采集
         print(f"  📝 缓存盘前数据备用...")
         premarket_memo = {
-            "daily_kline_str": daily_kline_str,
-            "min_kline_str": min_kline_str,
+            "daily_kline_str":     daily_kline_str,
+            "min_kline_str":       min_kline_str,
             "premarket_kline_str": premarket_kline_str,
-            "option_str": option_str,
-            "temp_str": temp_str,
-            "news_str": news_str,
-            "update_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            "option_str":          option_str,
+            "temp_str":            temp_str,
+            "news_str":            news_str,
+            "update_time":         datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         }
         write_cache(f"premarket_memo_{symbol.replace('.', '_')}.json", premarket_memo)
 
         # Step 8+9: 推送 AI
         print(f"  🤖 推送给 AI 分析...")
-        tg_send(f"🤖 **【盘前谋划启动】** {symbol}\n正在唤醒 AI 策略师进行多维分析...")
+        tg_send(f"⏳ **【盘前谋划】** {market_name} · 正在分析 {symbol}...")
         ai_reply = call_ai(wake_msg)
 
         if ai_reply:
@@ -935,7 +1007,7 @@ def run_premarket_batch(market: str):
     - 然后逐个标的分析，间隔5分钟
     """
     symbols = HK_SYMBOLS if market == "HK" else US_SYMBOLS
-    market_name = "港股" if market == "HK" else "美股"
+    market_name = "🇭🇰 港股" if market == "HK" else "🇺🇸 美股"
 
     print(f"\n{'#'*60}")
     print(f"[{datetime.now().strftime('%H:%M:%S')}] 🌅 盘前谋划启动: {market_name}")
@@ -948,22 +1020,25 @@ def run_premarket_batch(market: str):
         tg_send(msg)
         return
 
+    start_time = datetime.now()
+    market_flag = "🇭🇰" if market == "HK" else "🇺🇸"
     tg_send(
-        f"🌅 **【盘前谋划启动】** {market_name}\n"
-        f"标的列表: {', '.join(symbols)}\n"
-        f"预计耗时: ~{len(symbols) * 5} 分钟 (每标的间隔5分钟)"
+        f"{market_flag} **【盘前谋划启动】** {market_name} | {start_time.strftime('%H:%M')}"
+        f"\n标的列表: {', '.join(symbols)}"
+        f"\n预计耗时: ~{len(symbols) * 5} 分钟 (每标的间隔5分钟)"
     )
 
     try:
         for i, symbol in enumerate(symbols):
-            process_single_symbol(symbol, market)
+            process_single_symbol(symbol, market, market_name)
 
             # Step 11: 标的间隔（最后一个不需要等）
             if i < len(symbols) - 1:
                 print(f"\n⏳ 标的间隔冷却 {SYMBOL_INTERVAL // 60} 分钟...")
                 time.sleep(SYMBOL_INTERVAL)
 
-        tg_send(f"✅ **【盘前谋划完成】** {market_name}，共分析 {len(symbols)} 只标的。")
+        elapsed = int((datetime.now() - start_time).total_seconds() / 60)
+        tg_send(f"✅ **【盘前谋划完成】** {market_name} │ 共 {len(symbols)} 只标的 │ 耗时 {elapsed} 分钟")
         print(f"\n✅ 盘前谋划批次完成: {market_name}")
 
     except Exception as e:
