@@ -2,6 +2,8 @@ import logging
 import os
 import sys
 import asyncio
+import re
+from datetime import date, datetime
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -46,35 +48,151 @@ def restricted(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
+
+# ── 日期解析工具函数 ──────────────────────────────────────────────────────────
+def parse_date(raw: str) -> str:
+    """
+    将用户输入的各种日期格式统一解析为 YYYY-MM-DD 字符串。
+
+    支持的格式（自动以当年/当月补全）：
+      完整格式：
+        YYYY-MM-DD  /  YYYY/MM/DD  /  YYYYMMDD  /  MM/DD/YYYY
+      省略年份（补全为当年）：
+        MMDD  /  MM-DD  /  MM/DD
+      仅输入日（补全为当年当月）：
+        DD（纯 1-2 位数字，值在 1-31 之间）
+
+    返回标准格式字符串，如 "2026-04-21"。
+    解析失败时抛出 ValueError。
+    """
+    today = date.today()
+    s = raw.strip()
+
+    # 1. 完整格式：YYYY-MM-DD 或 YYYY/MM/DD
+    m = re.fullmatch(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})', s)
+    if m:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).strftime('%Y-%m-%d')
+
+    # 2. 完整格式：YYYYMMDD（8位纯数字）
+    m = re.fullmatch(r'(\d{4})(\d{2})(\d{2})', s)
+    if m:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).strftime('%Y-%m-%d')
+
+    # 3. 完整格式：MM/DD/YYYY
+    m = re.fullmatch(r'(\d{1,2})/(\d{1,2})/(\d{4})', s)
+    if m:
+        return date(int(m.group(3)), int(m.group(1)), int(m.group(2))).strftime('%Y-%m-%d')
+
+    # 4. 省略年份：MM-DD 或 MM/DD（补全为当年）
+    m = re.fullmatch(r'(\d{1,2})[-/](\d{1,2})', s)
+    if m:
+        return date(today.year, int(m.group(1)), int(m.group(2))).strftime('%Y-%m-%d')
+
+    # 5. 省略年份：MMDD 4位纯数字（补全为当年）
+    m = re.fullmatch(r'(\d{2})(\d{2})', s)
+    if m:
+        return date(today.year, int(m.group(1)), int(m.group(2))).strftime('%Y-%m-%d')
+
+    # 6. 仅输入日：1-2位纯数字（补全为当年当月）
+    m = re.fullmatch(r'(\d{1,2})', s)
+    if m:
+        day = int(m.group(1))
+        if not (1 <= day <= 31):
+            raise ValueError(f"日期中的「日」超出范围: {day}")
+        return date(today.year, today.month, day).strftime('%Y-%m-%d')
+
+    raise ValueError(f"无法识别的日期格式: {raw}")
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── 代码解析工具函数 ──────────────────────────────────────────────────────────
+def parse_code(raw: str) -> tuple[str, str]:
+    """
+    从 [Market].[Symbol] 格式中解析出市场和标准化代码。
+
+    支持的市场前缀（大小写不敏感）：HK / US
+    示例：
+      HK.03690  →  market="HK", code="HK.03690"
+      US.AAPL   →  market="US", code="US.AAPL"
+      hk.03690  →  market="HK", code="HK.03690"（自动转大写）
+
+    解析失败时抛出 ValueError。
+    """
+    parts = raw.upper().split(".", 1)
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"代码格式错误: {raw!r}，请使用 [市场].[代码] 格式，例如 HK.03690 或 US.AAPL")
+
+    market_prefix, symbol = parts
+    if market_prefix == "HK":
+        market = "HK"
+    elif market_prefix == "US":
+        market = "US"
+    else:
+        raise ValueError(f"无法识别的市场前缀: {market_prefix!r}，目前支持 HK 和 US")
+
+    code = f"{market}.{symbol}"
+    return market, code
+# ─────────────────────────────────────────────────────────────────────────────
+
+
 # 1. 核心交易处理逻辑 (处理 Buy 和 Sell)
 async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
-    try:
-        # 参数结构: /buy HK 美团 03690 2026-03-12 100 76.8 60
-        # 参数数量应为 7 个
-        if len(context.args) < 7:
-            raise ValueError("参数数量不足")
+    """
+    参数结构（市场从代码中自动识别，日期可省略）：
+      /buy  名字 代码 数量 价格 手续费 [日期]
+      /sell 名字 代码 数量 价格 手续费 [日期]
 
-        raw_market, name, raw_code, date, amount, price, fee = context.args
-        
-        # 1.1 市场识别增强
-        if raw_market.upper() in ["HK", "港股"]:
-            market = "HK"
-        elif raw_market.upper() in ["US", "美股"]:
-            market = "US"
-        else:
-            await update.message.reply_text(f"❌ 无法识别市场: {raw_market}\n请使用: HK/港股 或 US/美股")
+    代码格式：[Market].[Symbol]，例如 HK.03690 或 US.AAPL
+
+    示例：
+      /buy 美团 HK.03690 100 76.8 60              ← 日期默认今天
+      /buy 美团 HK.03690 100 76.8 60 20260312     ← YYYYMMDD
+      /buy 美团 HK.03690 100 76.8 60 2026/03/12   ← YYYY/MM/DD
+      /buy 美团 HK.03690 100 76.8 60 03/12/2026   ← MM/DD/YYYY
+      /buy 美团 HK.03690 100 76.8 60 0312          ← MMDD → 当年
+      /buy 美团 HK.03690 100 76.8 60 03/12         ← MM/DD → 当年
+      /buy 美团 HK.03690 100 76.8 60 12            ← DD → 当年当月
+      /buy 苹果 US.AAPL 10 210.5 5
+    """
+    try:
+        # 参数数量：5个（不含日期）或 6个（含日期）
+        if len(context.args) < 5:
+            raise ValueError("参数数量不足，至少需要 5 个参数")
+
+        name, raw_code, amount, price, fee = context.args[:5]
+        raw_date = context.args[5] if len(context.args) >= 6 else None
+
+        # 1.1 从代码中自动识别市场
+        try:
+            market, code = parse_code(raw_code)
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ {e}\n\n"
+                "💡 代码格式: [市场].[代码]\n"
+                "  港股示例: HK.03690\n"
+                "  美股示例: US.AAPL"
+            )
             return
 
-        # 1.2 代码格式清洗与标准化 (确保输出永远带有 HK. 或 US. 前缀)
-        # 第一步：统一转大写，并去掉用户可能误输入的旧前缀，拿到纯代码（如 03690 或 AAPL）
-        pure_code = raw_code.upper().replace("HK.", "").replace("US.", "")
-        
-        # 第二步：根据识别出的市场，强制补全前缀
-        if market == "HK":
-            code = f"HK.{pure_code}"  # 变成 HK.03690
+        # 1.2 日期解析（省略时使用今天）
+        if raw_date is None:
+            trade_date = date.today().strftime('%Y-%m-%d')
+            date_note = "（默认今日）"
         else:
-            code = f"US.{pure_code}"  # 变成 US.AAPL
-        
+            try:
+                trade_date = parse_date(raw_date)
+                date_note = ""
+            except ValueError as e:
+                await update.message.reply_text(
+                    f"❌ 日期格式错误: {e}\n\n"
+                    "💡 支持的日期格式:\n"
+                    "  完整: YYYY-MM-DD / YYYY/MM/DD / YYYYMMDD / MM/DD/YYYY\n"
+                    "  省略年份: MMDD / MM-DD / MM/DD（自动补全当年）\n"
+                    "  仅输入日: DD（自动补全当年当月）\n"
+                    "  省略日期: 不填则默认今天"
+                )
+                return
+
         # 1.3 调用逻辑层写入 Notion
         # 注意：notion_db_manager 内部应处理 side="Sell" 时数量转负数的逻辑
         res = notion_database_manager.record_transaction(
@@ -82,27 +200,37 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
             action=side,
             name=name,
             code=code,
-            date=date,
+            date=trade_date,
             amount=int(amount),
             price=float(price),
             fee=float(fee)
         )
-        
+
         icon = "🟢" if side == "Buy" else "🔴"
         status_text = "买入" if side == "Buy" else "卖出"
-        
+
         await update.message.reply_text(
             f"{icon} 识别为 [{market}] 市场 {status_text}\n"
+            f"📅 交易日期: {trade_date} {date_note}\n"
             f"--------------------------\n"
             f"{res['msg']}"
         )
-        
+
     except Exception as e:
         logging.error(f"交易记录失败: {str(e)}")
         await update.message.reply_text(
             f"❌ 录入失败!\n原因: {str(e)}\n\n"
-            f"💡 正确格式:\n/{side.lower()} 市场 名字 代码 日期 数量 价格 手续费\n"
-            f"示例: /{side.lower()} HK 美团 03690 2026-03-12 100 76.8 60"
+            f"💡 正确格式:\n"
+            f"/{side.lower()} 名字 代码 数量 价格 手续费 [日期]\n\n"
+            f"代码格式: [市场].[代码]，例如 HK.03690 或 US.AAPL\n\n"
+            f"日期可省略（默认今天），支持多种格式:\n"
+            f"  YYYY-MM-DD / YYYY/MM/DD / YYYYMMDD / MM/DD/YYYY\n"
+            f"  MMDD / MM-DD / MM/DD（自动补全当年）\n"
+            f"  DD（自动补全当年当月）\n\n"
+            f"示例:\n"
+            f"  /{side.lower()} 美团 HK.03690 100 76.8 60\n"
+            f"  /{side.lower()} 美团 HK.03690 100 76.8 60 20260312\n"
+            f"  /{side.lower()} 苹果 US.AAPL 10 210.5 5 0312"
         )
 
 # 2. 导出逻辑
@@ -113,7 +241,7 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
             raise ValueError("缺少参数")
 
         raw_market, raw_type = context.args
-        
+
         # 2.1 市场识别
         if raw_market.upper() in ["HK", "港股"]:
             market = "HK"
@@ -131,10 +259,10 @@ async def export(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await update.message.reply_text(f"❌ 类型错误: {raw_type}\n请使用: 持仓 或 流水")
             return
-        
+
         # 2.3 执行导出
         res = notion_database_manager.export_data_to_file(market, t_type)
-        
+
         if res['status'] == "success":
             file_path = res['msg']
             # 🚀 核心改动：直接把文件发给用户
@@ -161,23 +289,23 @@ async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if len(context.args) < 1:
             raise ValueError("缺少参数")
-            
+
         symbols = context.args
         await update.message.reply_text(f"⏳ 正在采集 {' '.join(symbols)} 的数据，可能需要 15-30 秒，请稍候...")
-        
+
         process = await asyncio.create_subprocess_exec(
             sys.executable, FETCH_SCRIPT, *symbols,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await process.communicate()
-        
+
         if process.returncode != 0:
-             await update.message.reply_text(f"❌ 采集失败:\n{stderr.decode('utf-8')}")
-             return
-             
+            await update.message.reply_text(f"❌ 采集失败:\n{stderr.decode('utf-8')}")
+            return
+
         stdout_text = stdout.decode('utf-8')
-        
+
         # 解析输出的文件路径
         output_files = []
         parsing_files = False
@@ -192,11 +320,11 @@ async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 line_stripped = line.strip()
                 if line_stripped:
                     output_files.append(line_stripped)
-                
+
         if not output_files:
             await update.message.reply_text("❌ 数据采集可能已完成，但未能找到报告文件。\n相关日志：\n" + stdout_text[-1000:])
             return
-            
+
         for file_path in output_files:
             if os.path.exists(file_path):
                 with open(file_path, 'rb') as doc:
@@ -207,7 +335,7 @@ async def fetch(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     )
             else:
                 await update.message.reply_text(f"❌ 找不到文件: {file_path}")
-                
+
     except Exception as e:
         await update.message.reply_text(f"❌ 采集指令错误: {str(e)}\n\n💡 示例:\n/fetch AAPL.US")
 
@@ -257,7 +385,7 @@ async def passwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info_text = "\n".join(info_lines)
         # 密码使用 Spoiler 隐藏（MarkdownV2 格式）
         escaped_info = info_text.replace(".", "\\.").replace("-", "\\-").replace("(", "\\(").replace(")", "\\)").replace("!", "\\!").replace("+", "\\+").replace("=", "\\=")
-        escaped_pwd  = "".join(
+        escaped_pwd = "".join(
             f"\\{c}" if c in r"\_*[]()~`>#+-=|{}.!" else c
             for c in password
         )
@@ -298,8 +426,7 @@ def main():
 
     print("🚀 Command Bot 正在运行...")
     print("✅ 已载入命令: /buy, /sell, /export, /fetch, /passwd")
-    
-    # 启动机器人
+
     app.run_polling()
 
 if __name__ == "__main__":
