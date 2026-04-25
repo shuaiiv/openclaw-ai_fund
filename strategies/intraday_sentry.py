@@ -56,6 +56,7 @@ load_dotenv(find_dotenv(), override=True)
 
 
 TG_BOT_TOKEN         = os.getenv("TG_BOT_TOKEN_CLAW")
+TG_BOT_TOKEN_QUANT   = os.getenv("TG_BOT_TOKEN_QUANT")
 TG_CHANNEL_ANALYSIS  = os.getenv("TG_CHANNEL_ID_ANALYSIS")
 TG_CHANNEL_ORDER     = os.getenv("TG_CHANNEL_ID_ORDER")
 # 已完备：old 变量保留向下兼容
@@ -95,7 +96,7 @@ def tg_analysis(text: str):
 
 def tg_order(text: str):
     """发往 Order 频道（订单成交/撒单/告警）"""
-    targets = [(TG_BOT_TOKEN, TG_CHANNEL_ORDER)] if TG_CHANNEL_ORDER else []
+    targets = [(TG_BOT_TOKEN_QUANT, TG_CHANNEL_ORDER)] if TG_CHANNEL_ORDER else []
     send_message_async(text, targets=targets)
 
 
