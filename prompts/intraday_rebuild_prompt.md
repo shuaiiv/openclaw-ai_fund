@@ -83,31 +83,15 @@
 
 ```json
 {
-  "当前标的.US": {
-    "status": "描述刚才成交后的持仓新状态 (如:完全止盈变空仓 / 已建底仓 100股)",
-    "cooldown_until": "YYYY-MM-DD HH:MM:SS (对应上述战术休眠要求时间)",
-    "macro_thesis": "【盘中重塑】讲解你基于现实盘口和成交事实，是如何修正了战略底色...",
-    "zones": { "必填项1": { ... }, "必填项2": { ... } },
-    "update_time": "YYYY-MM-DD HH:MM:SS (同步更新的时间戳)"
-  },
   "AAPL.US": {
-    "status": "已加仓 (成本 $170)",
-    "macro_thesis": "【盘前记忆】30日极值165-185。大级别上升通道。情绪错杀坚决买入；跌破 155 认输出局。",
-    "update_time": "2026-04-02 13:45:00",
+    "status": "已加仓 200股 (成本 $170)",
+    "cooldown_until": "2026-04-20 16:30:00",
+    "macro_thesis": "【盘中重塑】刚完成抄底建仓，盘口放量确认支撑有效。30日极值165-185，上升通道延续。下一步观察185突破动能。",
+    "update_time": "2026-04-20 15:30:00",
     "zones": {
       "take_profit": {"price": 195.0, "condition": ">=", "action": "SELL", "reason": "触及通道上轨，分批止盈"},
-      "add_position": {"price": 185.0, "condition": ">=", "action": "BUY", "reason": "放量突破平台，右侧顺势加仓"},
       "buy_oversold": {"price": 162.0, "condition": "<=", "action": "BUY", "reason": "情绪错杀跌至价值区间，左侧逢低加仓"},
       "stop_loss": {"price": 155.0, "condition": "<=", "action": "SELL", "reason": "跌破防守均线，逻辑破裂，纪律止损"}
-    }
-  },
-  "00100.HK": {
-    "status": "空仓",
-    "macro_thesis": "【盘前记忆】大盘拖累估值见底。重点关注 280 支撑和 310 突破。",
-    "update_time": "2026-04-02 13:45:00",
-    "zones": {
-      "buy_dip": {"price": 280.0, "condition": "<=", "action": "BUY", "reason": "历史底部确认，左侧初始建仓"},
-      "buy_breakout": {"price": 310.0, "condition": ">=", "action": "BUY", "reason": "右侧放量突破箱体，顺势建仓"}
     }
   }
 }

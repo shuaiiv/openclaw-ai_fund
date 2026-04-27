@@ -13,68 +13,55 @@ import requests
 import schedule
 from datetime import datetime, timedelta, date
 import pytz
-from dotenv import load_dotenv, find_dotenv
 from longbridge.openapi import Period, Market
 
 # ==========================================================
-# 📦 路径设置：将 longbridge/ 加入 sys.path，以便寻址 longbridge_server
-# 目录结构: for_openclaw/longbridge/, for_openclaw/strategies/
+# 📦 导入公共工具模块（路径设置、缓存、数据获取等均在 shared_utils 中初始化）
 # ==========================================================
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/strategies/
-_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
-sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
-sys.path.insert(0, os.path.join(_ROOT_DIR, "futu"))        # 将 futu/ 加入搜索路径
-sys.path.insert(0, os.path.join(_ROOT_DIR, "telegram"))    # 将 telegram/ 加入搜索路径
+from shared_utils import (
+    ROOT_DIR as _ROOT_DIR,
+    PLAN_FILE, CACHE_DIR, OPENCLAW_URL, OPENCLAW_HEADERS,
+    # 缓存读写
+    read_cache, write_cache,
+    # 交易计划读写
+    load_plan, save_plan,
+    # 标的代码转换
+    lb_to_futu,
+    # 资讯获取
+    fetch_latest_news,
+    # 期权数据
+    fetch_option_snapshot,
+)
 
 # ==========================================
-# 📦 从 longbridge_server 导入封装好的函数
+# 📦 从 longbridge_server 导入盘前专用函数
 # ==========================================
 from longbridge_server import (
     _logic_get_trading_days,                  # Step 0: 交易日查询
     get_account_asset,                        # Step 1: 账户持仓与购买力
     _logic_get_market_temperature,            # Step 2: 当前市场温度
-    _logic_get_market_temperature_history,    # Step 2: 历史市场温度历史
+    _logic_get_market_temperature_history,    # Step 2: 历史市场温度
     _logic_get_static_info,                   # Step 3: 标的基本信息
     _logic_get_financial_indexes,             # Step 3: 估值指标 (支持自定义)
     _logic_get_history_kline,                 # Step 4+5: K 线数据
     close_contexts,                           # 释放 WebSocket 连接
 )
 
-# 期权模块使用富途 API
-from futu_options_server import (
-    _logic_get_expiry_dates,                  # Step 6: 期权到期日
-    _logic_get_option_chain,                  # Step 6: 期权链
-    _logic_get_option_snapshots,              # Step 6: 期权行情(含 YQ 降级)
-    close_context as close_futu_context,      # 释放富途 OpenD 连接
-)
+# 释放富途 OpenD 连接
+from futu_options_server import close_context as close_futu_context
 
 # 导入 TG 发送工具
 from tg_sender import send_message_async
 
-# override=True 确保覆盖系统环境中可能存在的同名旧变量
-load_dotenv(find_dotenv(), override=True)
-
 
 # ==========================================
-# ⚙️ 配置层
+# ⚙️ 盘前专用配置
 # ==========================================
 
 TG_BOT_TOKEN = os.getenv("TG_BOT_TOKEN_CLAW")
 TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID_ANALYSIS")
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))   # OpenClaw/strategies/
-_ROOT_DIR   = os.path.dirname(SCRIPT_DIR)                    # OpenClaw/
-PLAN_FILE   = os.path.join(_ROOT_DIR, "data", "daily_trading_plan.json")
-CACHE_DIR   = os.path.join(_ROOT_DIR, "data", "cache")
 PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "premarket_planner_prompt.md")
-
-OPENCLAW_URL = "http://127.0.0.1:18789/v1/chat/completions"
-OPENCLAW_HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {os.getenv('OPENCLAW_GATEWAY_TOKEN', '')}",
-    "x-openclaw-scopes": "operator.admin,operator.write",
-}
 
 # 标的列表
 HK_SYMBOLS = ["0700.HK", "09988.HK", "01810.HK"]
@@ -89,50 +76,13 @@ with open(PROMPT_FILE, "r", encoding="utf-8") as f:
 
 
 # ==========================================
-# 🛠️ 工具层
+# 🛠️ 盘前专用工具
 # ==========================================
 
 def tg_send(text: str):
     """发送 Telegram 消息 (后台免阻塞)"""
     targets = [(TG_BOT_TOKEN, TG_CHANNEL_ID)] if TG_CHANNEL_ID else []
     send_message_async(text, targets=targets)
-
-
-def ensure_cache_dir():
-    """确保缓存目录存在"""
-    if not os.path.exists(CACHE_DIR):
-        os.makedirs(CACHE_DIR)
-
-
-def read_cache(filename: str) -> dict | list | None:
-    """读取本地 JSON 缓存文件"""
-    path = os.path.join(CACHE_DIR, filename)
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return None
-
-
-def write_cache(filename: str, data):
-    """写入本地 JSON 缓存文件"""
-    ensure_cache_dir()
-    path = os.path.join(CACHE_DIR, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def load_plan() -> dict:
-    """读取当前交易计划 JSON"""
-    if os.path.exists(PLAN_FILE):
-        with open(PLAN_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_plan(plan: dict):
-    """保存交易计划 JSON"""
-    with open(PLAN_FILE, "w", encoding="utf-8") as f:
-        json.dump(plan, f, ensure_ascii=False, indent=4)
 
 
 # ==========================================
@@ -574,150 +524,14 @@ def fetch_premarket_kline_us(symbol: str) -> str:
 # 🛠️ 股票代码格式转换工具
 # ==========================================
 
-def lb_to_futu(symbol: str) -> str:
-    """
-    将长桥格式代码转换为富途格式代码。
-    长桥: 'AAPL.US' / '0700.HK' / '9988.HK'
-    富途: 'US.AAPL' / 'HK.00700' / 'HK.09988'
-
-    注意: 富途港股代码固定 5 位，需补零；美股代码直接拼接。
-    """
-    parts = symbol.rsplit(".", 1)
-    if len(parts) != 2:
-        return symbol  # 无法识别时原样返回
-    ticker, market = parts[0], parts[1].upper()
-    if market == "HK":
-        ticker = ticker.lstrip("0").zfill(5)   # 去掉多余前导零后补足为 5 位
-    return f"{market}.{ticker}"
+# lb_to_futu 已移至 shared_utils
 
 
 # ==========================================
 # 📡 Step 6: 期权信息
 # ==========================================
 
-def fetch_option_data(symbol: str, current_price: float = 0) -> str:
-    """
-    获取标的的期权信息：本周末/两周后/四周后三个到期日的 ATM 合约深度数据。
-    输入 symbol 使用长桥格式，内部自动转换为富途格式。
-    """
-    try:
-        futu_code = lb_to_futu(symbol)  # e.g. "AAPL.US" -> "US.AAPL"
-        opt_dates_raw = _logic_get_expiry_dates(futu_code)
-
-        if isinstance(opt_dates_raw, dict) and "error" in opt_dates_raw:
-            return f"期权到期日获取失败: {opt_dates_raw['error']}"
-        if not isinstance(opt_dates_raw, list) or not opt_dates_raw:
-            return "该标的暂无期权数据。"
-
-        today = datetime.now().date()
-        # opt_dates_raw 每条包含 strike_time 字段
-        future_dates = []
-        for r in opt_dates_raw:
-            date_str = r.get("strike_time", "")
-            try:
-                d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                if d > today:
-                    future_dates.append(d)
-            except (ValueError, TypeError):
-                pass
-        future_dates = sorted(future_dates)
-
-        if not future_dates:
-            return "该标的暂无未来期权到期日。"
-
-        # 计算目标到期日
-        # 今天 days_to_friday：到本周五的天数（最少 1 天）
-        days_to_friday = (4 - today.weekday()) % 7 or 7
-        this_friday    = today + timedelta(days=days_to_friday)
-
-        # 自适应中期到期日：
-        #   如果距本周五 <=3 天（周三/周四/周五），则选“下下周末”，避免前两个日期太贴近
-        #   否则（周一/周二）选“下周末”
-        next_weeks = 2 if days_to_friday <= 3 else 1
-        middle_friday  = today + timedelta(days=days_to_friday + next_weeks * 7)
-        four_weeks_out = today + timedelta(days=28)
-
-        def pick_closest(dates, target):
-            return min(dates, key=lambda d: abs((d - target).days))
-
-        # 三个目标到期日
-        target_dates = [
-            (pick_closest(future_dates, this_friday),    "本周末"),
-            (pick_closest(future_dates, middle_friday),  "下周末" if next_weeks == 1 else "下下周末"),
-            (pick_closest(future_dates, four_weeks_out), "四周后"),
-        ]
-        seen = set()
-        unique_targets = []
-        for d, label in target_dates:
-            if d not in seen:
-                seen.add(d)
-                unique_targets.append((d, label))
-
-        # 如果没有现价，先获取
-        if current_price <= 0:
-            from longbridge_server import _logic_get_live_quote
-            quote = _logic_get_live_quote(symbol)
-            current_price = quote.get("price", 0)
-
-        # 收集 ATM 合约的 futu_code
-        target_symbols: list[str] = []       # futu 期权代码
-        date_labels: dict[str, str] = {}     # futu_code -> 标签
-
-        for exp_date, label in unique_targets:
-            exp_str = exp_date.strftime("%Y-%m-%d")
-            chain = _logic_get_option_chain(futu_code, exp_str)
-            if not isinstance(chain, list) or not chain:
-                continue
-
-            # 富途链每条有 option_type(“CALL”/“PUT”) + strike_price + futu_code
-            calls = [c for c in chain if "CALL" in str(c.get("option_type", "")).upper()]
-            puts  = [c for c in chain if "PUT"  in str(c.get("option_type", "")).upper()]
-
-            for contracts, direction in [(calls, "Call"), (puts, "Put")]:
-                if not contracts:
-                    continue
-                atm = min(contracts, key=lambda o: abs((o.get("strike_price") or 0) - current_price))
-                fc  = atm.get("futu_code", "")
-                sp  = atm.get("strike_price", "N/A")
-                if fc:
-                    target_symbols.append(fc)
-                    date_labels[fc] = f"{label}({exp_str}) {direction} 行权价={sp}"
-
-        if not target_symbols:
-            return "该标的暂无查询到有效期权合约。"
-
-        # 批量查行情（富途主通 → YahooQuery 自动降级）
-        opt_quotes = _logic_get_option_snapshots(target_symbols)
-        if not isinstance(opt_quotes, list) or not opt_quotes:
-            return "期权行情请求返回空。"
-
-        lines = ["🛡️ 期权深度分析 (ATM IV/OI):　[🔗富途行情 | YQ 降级支持]　"]
-        for q in opt_quotes:
-            if "error" in q:
-                continue
-            fc  = q.get("futu_code", "")
-            lbl = date_labels.get(fc, fc)
-            try:
-                iv_val = q.get("implied_volatility")
-                iv_str = f"{float(iv_val):.1f}%" if iv_val is not None else "N/A"
-            except (TypeError, ValueError):
-                iv_str = "N/A"
-            src = q.get("_source", "")
-            lines.append(
-                f"  📌 {lbl} | IV={iv_str} | "
-                f"OI={q.get('open_interest', 'N/A')} | "
-                f"Vol={q.get('volume', 'N/A')} | "
-                f"Last={q.get('last_price', 'N/A')}"
-                + (f" [{src}]" if src else "")
-            )
-
-        if len(lines) == 1:
-            return "期权行情匹配为空。"
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"期权数据暂不可用: {e}"
+# fetch_option_data 已移至 shared_utils (fetch_option_snapshot)
 
 
 
@@ -725,33 +539,7 @@ def fetch_option_data(symbol: str, current_price: float = 0) -> str:
 # 📡 Step 7: Tavily 资讯
 # ==========================================
 
-def fetch_latest_news(symbol: str) -> str:
-    """通过 Tavily 拉取最新资讯（盘前用 advanced 模式）"""
-    if not TAVILY_API_KEY:
-        return "未配置 Tavily API，暂无资讯。"
-    try:
-        # 提取标的名称用于搜索
-        ticker = symbol.split(".")[0]
-        res = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": f"{ticker} stock latest news analysis earnings outlook",
-                "search_depth": "advanced",
-                "include_answer": True,
-                "max_results": 5,
-            },
-            timeout=15,
-        )
-        if res.status_code == 200:
-            data = res.json()
-            text = f"【AI 总结】: {data.get('answer', '无')}\n"
-            for idx, r in enumerate(data.get("results", [])):
-                text += f"  {idx+1}. {r.get('title', '')}\n"
-            return text
-        return "资讯获取失败。"
-    except Exception as e:
-        return f"资讯拉取异常: {e}"
+# fetch_latest_news 已移至 shared_utils
 
 
 # ==========================================
@@ -888,7 +676,7 @@ def handle_ai_result(symbol: str, ai_reply: str):
         tg_send(f"⚠️ {symbol} 盘前谋划 AI 未返回网格 JSON")
 
     # 2. 推送 AI 分析报告
-    prefix = f"💭 **【盘前策略报告】** {symbol}\n"
+    prefix = f"💭 **盘前策略报告** ┃ **{symbol}**\n━━━━━━━━━━━━━━━━━━━━━\n"
     max_safe = 4000  # 内容最大字符数（含前缀不超过 4096）
     if len(prefix) + len(ai_reply) <= max_safe:
         tg_send(prefix + ai_reply)
@@ -897,7 +685,7 @@ def handle_ai_result(symbol: str, ai_reply: str):
         chunk_size = max_safe - len(prefix)
         chunks = [ai_reply[i:i+chunk_size] for i in range(0, len(ai_reply), chunk_size)]
         for i, chunk in enumerate(chunks):
-            header = prefix if i == 0 else f"💭 **【盘前策略报告】** {symbol} (续 {i+1})\n"
+            header = prefix if i == 0 else f"💭 **盘前策略报告** ┃ **{symbol}** (续 {i+1})\n━━━━━━━━━━━━━━━━━━━━━\n"
             tg_send(header + chunk)
 
 
@@ -913,25 +701,25 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
 
     try:
         # Step 1: 账户状态
-        print(f"  📡 Step 1/7: 获取账户状态...")
+        print(f"  📡 Step 1/8: 获取账户状态...")
         account_str = fetch_account_status(market)
         qty, cost = get_symbol_position(symbol)
         position_str = f"已持仓 {qty}股 (成本 ${cost:.2f})" if qty > 0 else "空仓"
 
         # Step 2: 市场温度
-        print(f"  📡 Step 2/7: 获取市场温度...")
+        print(f"  📡 Step 2/8: 获取市场温度...")
         temp_str = fetch_market_temperature(market)
 
         # Step 3: 标的基本信息
-        print(f"  📡 Step 3/7: 获取标的基本信息...")
+        print(f"  📡 Step 3/8: 获取标的基本信息...")
         static_str = fetch_static_info(symbol)
 
         # Step 4: 60日日K线
-        print(f"  📡 Step 4/7: 获取60日日K线...")
+        print(f"  📡 Step 4/8: 获取60日日K线...")
         daily_kline_str = fetch_daily_kline(symbol)
 
         # Step 5: 3日10分钟K线
-        print(f"  📡 Step 5/7: 获取短周期K线...")
+        print(f"  📡 Step 5/8: 获取短周期K线...")
         min_kline_str = fetch_min10_kline(symbol)
 
         # Step 5b: 美股当日盘前 5min K线（仅美股）
@@ -943,11 +731,11 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
         # Step 6: 期权数据
         print(f"  📡 Step 6/8: 获取期权数据...")
         # 富途 API 支持港股和美股期权，统一调用；内部已有完整容错
-        option_str = fetch_option_data(symbol)
+        option_str = fetch_option_snapshot(symbol, current_price=0)
 
         # Step 7: 最新资讯
         print(f"  📡 Step 7/8: 获取最新资讯...")
-        news_str = fetch_latest_news(symbol)
+        news_str = fetch_latest_news(symbol, mode="advanced")
 
         # Step 8: 组装消息
         print(f"  📝 组装 AI 投喂消息...")
@@ -981,7 +769,7 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
 
         # Step 8+9: 推送 AI
         print(f"  🤖 推送给 AI 分析...")
-        tg_send(f"⏳ **【盘前谋划】** {market_name} · 正在分析 {symbol}...")
+        tg_send(f"⏳ 正在分析 ┃ **{symbol}** ┃ {market_name}")
         ai_reply = call_ai(wake_msg)
 
         if ai_reply:
@@ -1023,9 +811,10 @@ def run_premarket_batch(market: str):
     start_time = datetime.now()
     market_flag = "🇭🇰" if market == "HK" else "🇺🇸"
     tg_send(
-        f"{market_flag} **【盘前谋划启动】** {market_name} | {start_time.strftime('%H:%M')}"
-        f"\n标的列表: {', '.join(symbols)}"
-        f"\n预计耗时: ~{len(symbols) * 5} 分钟 (每标的间隔5分钟)"
+        f"{market_flag} **盘前谋划启动** ┃ {market_name}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📋 标的: {', '.join(symbols)}\n"
+        f"⏱️ 预计: ~{len(symbols) * 5} 分钟"
     )
 
     try:
@@ -1038,7 +827,7 @@ def run_premarket_batch(market: str):
                 time.sleep(SYMBOL_INTERVAL)
 
         elapsed = int((datetime.now() - start_time).total_seconds() / 60)
-        tg_send(f"✅ **【盘前谋划完成】** {market_name} │ 共 {len(symbols)} 只标的 │ 耗时 {elapsed} 分钟")
+        tg_send(f"✅ **盘前谋划完成** ┃ {market_name} ┃ 共 {len(symbols)} 只 ┃ 耗时 {elapsed}min")
         print(f"\n✅ 盘前谋划批次完成: {market_name}")
 
     except Exception as e:

@@ -6,21 +6,29 @@ import re
 import requests
 from datetime import datetime, timedelta
 import pytz
-from dotenv import load_dotenv, find_dotenv
 from longbridge.openapi import Period, Market
 
 # ==========================================================
-# 📦 路径设置：将 longbridge/ 加入 sys.path，以便寻址 longbridge_server
-# 目录结构: for_openclaw/longbridge/, for_openclaw/strategies/
+# 📦 导入公共工具模块（路径设置、缓存、数据获取等均在 shared_utils 中初始化）
 # ==========================================================
-_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))   # for_openclaw/strategies/
-_ROOT_DIR   = os.path.dirname(_SCRIPT_DIR)                  # for_openclaw/
-sys.path.insert(0, os.path.join(_ROOT_DIR, "longbridge"))  # 将 longbridge/ 加入搜索路径
-sys.path.insert(0, os.path.join(_ROOT_DIR, "futu"))        # 将 futu/ 加入搜索路径
-sys.path.insert(0, os.path.join(_ROOT_DIR, "telegram"))    # 将 telegram/ 加入搜索路径
+from shared_utils import (
+    ROOT_DIR as _ROOT_DIR,
+    PLAN_FILE, CACHE_DIR, OPENCLAW_URL, OPENCLAW_HEADERS,
+    TAVILY_API_KEY,
+    # 缓存读写
+    read_cache, write_cache,
+    # 交易计划读写
+    load_plan, save_plan,
+    # 标的代码转换
+    lb_to_futu,
+    # 基础数据获取
+    fetch_static_info, fetch_financial_indexes, fetch_latest_news,
+    # 期权数据
+    fetch_option_snapshot,
+)
 
 # ==========================================
-# 📦 从 longbridge_server 导入所有封装好的函数
+# 📦 从 longbridge_server 导入哨兵专用函数
 # 彻底解耦：此文件不再直接依赖 longbridge SDK 的上下文创建逻辑
 # ==========================================
 from longbridge_server import (
@@ -28,8 +36,6 @@ from longbridge_server import (
     _logic_get_live_quote,              # 获取单只股票实时行情
     _logic_get_capital_distribution,    # 获取主力资金分布
     _logic_get_history_kline,           # 获取历史 K 线 (返回 dict 列表)
-    _logic_get_static_info,             # 获取标的基本静态信息
-    _logic_get_financial_indexes,       # 获取估值指标 (PE/PB/市値等)
     _logic_get_market_temperature,      # 获取市场温度
     submit_trade_order,                 # 下单 (内置 TG 通知)
     cancel_order_by_id,                 # 撤单
@@ -39,31 +45,19 @@ from longbridge_server import (
     close_contexts,                     # 释放 WebSocket 连接
 )
 
-# 期权模块使用富途 API
-from futu_options_server import (
-    _logic_get_expiry_dates,            # 获取期权到期日列表
-    _logic_get_option_chain,            # 获取指定到期日的期权链 (futu 格式)
-    _logic_get_option_snapshots,        # 获取期权深度行情 IV/OI (含 YahooQuery 降级)
-    close_context as close_futu_context, # 释放富途 OpenD 连接
-)
+# 释放富途 OpenD 连接
+from futu_options_server import close_context as close_futu_context
 
 # 导入 TG 发送工具
 from tg_sender import send_message_async
-
-
-# override=True 确保覆盖系统环境中可能存在的同名旧变量
-load_dotenv(find_dotenv(), override=True)
 
 
 TG_BOT_TOKEN         = os.getenv("TG_BOT_TOKEN_CLAW")
 TG_BOT_TOKEN_QUANT   = os.getenv("TG_BOT_TOKEN_QUANT")
 TG_CHANNEL_ANALYSIS  = os.getenv("TG_CHANNEL_ID_ANALYSIS")
 TG_CHANNEL_ORDER     = os.getenv("TG_CHANNEL_ID_ORDER")
-# 已完备：old 变量保留向下兼容
-TG_CHANNEL_ID        = TG_CHANNEL_ANALYSIS
+TG_CHANNEL_ID        = TG_CHANNEL_ANALYSIS  # 向下兼容
 
-PLAN_FILE     = os.path.join(_ROOT_DIR, "data", "daily_trading_plan.json")
-CACHE_DIR     = os.path.join(_ROOT_DIR, "data", "cache")   # 与 premarket_planner 共享同一缓存目录
 POLL_INTERVAL = 300  # 5分钟轮询
 
 # 🚨 系统提示词
@@ -75,17 +69,9 @@ PROMPT_REBUILD_FILE = os.path.join(_ROOT_DIR, "prompts", "intraday_rebuild_promp
 with open(PROMPT_REBUILD_FILE, "r", encoding="utf-8") as f:
     INTRADAY_REBUILD_PROMPT = f.read()
 
-TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-
-OPENCLAW_URL = "http://127.0.0.1:18789/v1/chat/completions"
-OPENCLAW_HEADERS = {
-    "Content-Type": "application/json",
-    "Authorization": f"Bearer {os.getenv('OPENCLAW_GATEWAY_TOKEN', '')}",
-    "x-openclaw-scopes": "operator.admin,operator.write",
-}
 
 # ===========================================================================
-# 🛠️ 工具函数层
+# 🛠️ 哨兵专用工具函数
 # ===========================================================================
 
 def tg_analysis(text: str):
@@ -105,55 +91,7 @@ def tg_send(text: str):
     tg_analysis(text)
 
 
-def _ensure_cache_dir():
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-
-def read_cache(filename: str) -> dict | list | None:
-    """读取本地 JSON 缓存（与 premarket_planner 共用同一目录）"""
-    path = os.path.join(CACHE_DIR, filename)
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return None
-
-
-def write_cache(filename: str, data):
-    """写入本地 JSON 缓存"""
-    _ensure_cache_dir()
-    path = os.path.join(CACHE_DIR, filename)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
-def fetch_latest_news(symbol: str) -> str:
-    """通过 Tavily 拉取最新资讯"""
-    if not TAVILY_API_KEY:
-        return "未配置 Tavily API，暂无资讯。"
-    try:
-        res = requests.post(
-            "https://api.tavily.com/search",
-            json={
-                "api_key": TAVILY_API_KEY,
-                "query": f"{symbol} stock latest news today financial",
-                "search_depth": "basic",
-                "include_answer": True,
-                "max_results": 3,
-            },
-            timeout=10,
-        )
-        if res.status_code == 200:
-            data = res.json()
-            text = f"【AI 总结】: {data.get('answer', '无')}\n"
-            for idx, r in enumerate(data.get("results", [])):
-                text += f"{idx+1}. {r.get('title')}\n"
-            return text
-        return "资讯获取失败。"
-    except Exception as e:
-        return f"资讯拉取异常: {e}"
+# fetch_latest_news 已移至 shared_utils
 
 
 # ===========================================================================
@@ -376,62 +314,7 @@ def fetch_account_status(symbol: str) -> tuple[str, str, float, str]:
 # 📁 静态信息 / 估值指标 / 市场温度（含阶段性缓存）
 # ===========================================================================
 
-def fetch_static_info(symbol: str) -> str:
-    """
-    获取标的基本静态信息（名称/板块/货币/手数/总股本）—— 永久缓存。
-    与 premarket_planner 共用 cache/static_info_<symbol>.json。
-    """
-    cache_file = f"static_info_{symbol.replace('.', '_')}.json"
-    cached = read_cache(cache_file)
-
-    if cached:
-        static = cached
-    else:
-        static = _logic_get_static_info(symbol)
-        if static and "error" not in static:
-            write_cache(cache_file, static)
-
-    if not static or "error" in static:
-        return f"标的基本信息获取失败: {static.get('error', 'Unknown')}"
-
-    return (
-        f"  名称: {static.get('name', 'N/A')} | "
-        f"板块: {static.get('board', 'N/A')} | "
-        f"货币: {static.get('currency', 'N/A')} | "
-        f"每手: {static.get('lot_size', 'N/A')} | "
-        f"总股本: {static.get('total_shares', 'N/A')}"
-    )
-
-
-def fetch_financial_indexes(symbol: str) -> str:
-    """
-    获取标的估值指标（PE/PB/总市值/股息率/换手率/量比）—— 当日缓存。
-    """
-    today_str  = datetime.now().strftime("%Y-%m-%d")
-    cache_file = f"financials_{symbol.replace('.', '_')}.json"
-    cached     = read_cache(cache_file)
-
-    if cached and isinstance(cached, dict) and cached.get("_date") == today_str:
-        fin = cached
-    else:
-        fin = _logic_get_financial_indexes(symbol)
-        if fin and "error" not in fin:
-            fin["_date"] = today_str
-            write_cache(cache_file, fin)
-
-    if not fin or "error" in fin:
-        return f"估值指标获取失败: {fin.get('error', 'Unknown') if fin else 'Unknown'}"
-
-    labels = {
-        "total_market_value":  "总市值",
-        "pe_ttm_ratio":        "PE(TTM)",
-        "pb_ratio":            "PB",
-        "dividend_ratio_ttm": "股息率(TTM)",
-        "turnover_rate":       "换手率",
-        "volume_ratio":        "量比",
-    }
-    parts = [f"{label}: {fin[key]}" for key, label in labels.items() if fin.get(key)]
-    return " | ".join(parts) if parts else "估值指标暂不可用"
+# fetch_static_info, fetch_financial_indexes, lb_to_futu, fetch_option_snapshot 已移至 shared_utils
 
 
 def fetch_market_temperature(symbol: str) -> str:
@@ -509,211 +392,147 @@ def fetch_kline_data(symbol: str, current_price: float) -> tuple[str, float]:
         return f"当日K线拉取失败: {e}", 0.0
 
 
-def lb_to_futu(symbol: str) -> str:
+# ===========================================================================
+# 📡 公共数据采集层
+# ===========================================================================
+
+def _collect_market_data(symbol: str, current_price: float) -> dict:
     """
-    将长桥格式代码转换为富途格式代码。
-    长桥: 'AAPL.US' / '0700.HK' / '9988.HK'
-    富途: 'US.AAPL' / 'HK.00700' / 'HK.09988'
-
-    注意: 富途港股代码固定 5 位，需补零；美股代码直接拼接。
+    公共数据采集层：一次性采集所有维度的盘面数据。
+    网格触线流程和订单事件流程共享此函数，避免代码重复。
     """
-    parts = symbol.rsplit(".", 1)
-    if len(parts) != 2:
-        return symbol
-    ticker, market = parts[0], parts[1].upper()
-    if market == "HK":
-        ticker = ticker.lstrip("0").zfill(5)   # 去掉多余前导零后补足为 5 位
-    return f"{market}.{ticker}"
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📡 正在采集 {symbol} 全维度盘面数据...")
 
+    money_str, pos_str, _, all_positions_str = fetch_account_status(symbol)
+    static_str       = fetch_static_info(symbol)
+    financials_str   = fetch_financial_indexes(symbol)
+    temperature_str  = fetch_market_temperature(symbol)
+    flow_str         = fetch_capital_flow(symbol)
+    today_k_str, change_pct = fetch_kline_data(symbol, current_price)
+    opt_str          = fetch_option_snapshot(symbol, current_price)
+    today_orders_str = fetch_today_orders(symbol)
+    premarket_memo   = read_cache(f"premarket_memo_{symbol.replace('.', '_')}.json")
 
-def fetch_option_snapshot(symbol: str, current_price: float) -> str:
-    """
-    期权异动探针：智能选期（本周末 + 两周后 + 四周后）→ 提取 ATM 合约 → 查 IV/OI（含 YahooQuery 降级）。
-    输入 symbol 使用长桥格式，内部自动转换为富途格式。
-    返回可读字符串。
-    """
-    try:
-        futu_code = lb_to_futu(symbol)  # e.g. "AAPL.US" -> "US.AAPL"
-        opt_dates_raw = _logic_get_expiry_dates(futu_code)
-
-        if isinstance(opt_dates_raw, dict) and "error" in opt_dates_raw:
-            return f"期权到期日获取失败: {opt_dates_raw['error']}"
-        if not isinstance(opt_dates_raw, list) or not opt_dates_raw:
-            return "该标的暂无期权到期日。"
-
-        today = datetime.now().date()
-        future_dates = []
-        for r in opt_dates_raw:
-            date_str = r.get("strike_time", "")
-            try:
-                d = datetime.strptime(date_str, "%Y-%m-%d").date()
-                if d > today:
-                    future_dates.append(d)
-            except (ValueError, TypeError):
-                pass
-        future_dates = sorted(future_dates)
-        if not future_dates:
-            return "该标的暂无未来期权到期日。"
-
-        days_to_friday = (4 - today.weekday()) % 7 or 7
-        this_friday    = today + timedelta(days=days_to_friday)
-
-        # 自适应中期到期日：
-        #   如果距本周五 <=3 天（周三/周四/周五），选"下下周末"，避免前两个日期太贴近
-        #   否则（周一/周二）选"下周末"
-        next_weeks = 2 if days_to_friday <= 3 else 1
-        middle_friday  = today + timedelta(days=days_to_friday + next_weeks * 7)
-        four_weeks_out = today + timedelta(days=28)
-
-        def pick_closest(dates, target):
-            return min(dates, key=lambda d: abs((d - target).days))
-
-        near_date       = pick_closest(future_dates, this_friday)
-        middle_date     = pick_closest(future_dates, middle_friday)
-        four_week_date  = pick_closest(future_dates, four_weeks_out)
-        middle_label    = "下周末" if next_weeks == 1 else "下下周末"
-
-        # 去重：三个目标日期可能重合
-        seen = set()
-        targets = []
-        for d, label in [(near_date, "本周末"), (middle_date, middle_label), (four_week_date, "四周后")]:
-            if d not in seen:
-                seen.add(d)
-                targets.append((d, label))
-
-        target_symbols: list[str] = []
-        date_labels: dict[str, str] = {}
-
-        for exp_date, label in targets:
-            exp_str = exp_date.strftime("%Y-%m-%d")
-            chain = _logic_get_option_chain(futu_code, exp_str)
-            if not isinstance(chain, list) or not chain:
-                continue
-
-            # 富途链每条有 option_type(“CALL”/“PUT”) + strike_price + futu_code
-            calls = [c for c in chain if "CALL" in str(c.get("option_type", "")).upper()]
-            puts  = [c for c in chain if "PUT"  in str(c.get("option_type", "")).upper()]
-
-            for contracts, direction in [(calls, "真 Call"), (puts, "真 Put")]:
-                if not contracts:
-                    continue
-                atm = min(contracts, key=lambda o: abs((o.get("strike_price") or 0) - current_price))
-                fc  = atm.get("futu_code", "")
-                sp  = atm.get("strike_price", "N/A")
-                if fc:
-                    target_symbols.append(fc)
-                    date_labels[fc] = f"{label}({exp_str}) {direction} 行权价={sp}"
-
-        if not target_symbols:
-            return "该标的暂无查询到有效期权合约。"
-
-        # 批量查行情（富途官方 → YahooQuery 自动降级）
-        opt_quotes = _logic_get_option_snapshots(target_symbols)
-        if not isinstance(opt_quotes, list) or not opt_quotes:
-            return "期权行情请求返回空。"
-
-        lines = []
-        for q in opt_quotes:
-            if "error" in q:
-                continue
-            fc  = q.get("futu_code", "")
-            lbl = date_labels.get(fc, fc)
-            try:
-                iv_val = q.get("implied_volatility")
-                iv_str = f"{float(iv_val):.1f}%" if iv_val is not None else "N/A"
-            except (TypeError, ValueError):
-                iv_str = "N/A"
-            src = q.get("_source", "")
-            lines.append(
-                f"  📌 {lbl} | IV={iv_str} | "
-                f"OI={q.get('open_interest', 'N/A')} | "
-                f"Vol={q.get('volume', 'N/A')} | "
-                f"Last={q.get('last_price', 'N/A')}"
-                + (f" [{src}]" if src else "")
-            )
-
-        if not lines:
-            return "期权行情匹配为空。"
-
-        result = "期权深度分析 (ATM IV/OI 探针):\n" + "\n".join(lines)
-        if any("降级" in q.get("_source", "") or "Fallback" in q.get("_source", "") for q in opt_quotes):
-            result = "[降级通道 YahooQuery] " + result
-        return result
-
-    except Exception as e:
-        return f"期权数据暂不可用: {e}"
+    return {
+        "money_str": money_str, "pos_str": pos_str,
+        "all_positions_str": all_positions_str,
+        "static_str": static_str, "financials_str": financials_str,
+        "temperature_str": temperature_str, "flow_str": flow_str,
+        "today_k_str": today_k_str, "change_pct": change_pct,
+        "opt_str": opt_str, "today_orders_str": today_orders_str,
+        "premarket_memo": premarket_memo,
+    }
 
 
 # ===========================================================================
 # 📝 消息构建层
 # ===========================================================================
 
-def build_wake_message(
+def _build_premarket_review(pm: dict) -> str:
+    """提取盘前缓存数据并格式化为回顾段落（两个消息构建器共用）"""
+    return (
+        f"📈 60日日K线与10分钟结构：\n{pm.get('daily_kline_str', '暂无记录')}\n\n"
+        f"{pm.get('min_kline_str', '暂无记录')}\n\n"
+        f"🌅 美股盘前5分钟动能：\n{pm.get('premarket_kline_str', '暂无记录')}\n\n"
+        f"🌡️ 盘前历史温度与期权阵地：\n{pm.get('temp_str', '暂无记录')}\n\n"
+        f"{pm.get('option_str', '暂无记录')}\n\n"
+        f"📰 盘前核心资讯：\n{pm.get('news_str', '暂无记录')}"
+    )
+
+
+def _build_realtime_section(ctx: dict, news_info: str) -> str:
+    """构建当日实时盘面数据段落（两个消息构建器共用）"""
+    return (
+        f"🌡️ 实时市场温度：{ctx['temperature_str']}\n\n"
+        f"💰 实时主力资金分布：\n{ctx['flow_str']}\n\n"
+        f"🛡️ 实时期权异动探针：\n{ctx['opt_str']}\n\n"
+        f"🛒 今日相关订单：\n{ctx['today_orders_str']}\n\n"
+        f"📈 **【今日 5 分钟微观全息数据】**：\n"
+        f"```\n{ctx['today_k_str']}\n```\n\n"
+        f"📰 **【此时此刻最新突发资讯】**：\n"
+        f"{news_info}"
+    )
+
+
+def build_grid_trigger_message(
     symbol: str,
     current_price: float,
     zone_name: str,
     trigger_price: float,
     macro_thesis: str,
-    money_str: str,
-    pos_str: str,
-    all_positions_str: str,
-    static_str: str,
-    financials_str: str,
-    temperature_str: str,
-    flow_str: str,
-    opt_str: str,
-    today_orders_str: str,
-    today_k_str: str,
+    ctx: dict,
     news_info: str,
-    special_event_msg: str = "",
-    premarket_memo: dict = None,
-    is_rebuild: bool = False,
 ) -> str:
-    """将所有盘面数据组装成发给 AI 的完整唤醒提示词"""
-    event_header = f"🔔 **【底层系统事件注入】**: {special_event_msg}\n\n" if special_event_msg else ""
+    """将盘面数据组装为【网格触线裁决】专用唤醒提示词"""
+    pm = ctx["premarket_memo"] or {}
+    pm_review = _build_premarket_review(pm)
+    realtime = _build_realtime_section(ctx, news_info)
 
-    # 提取盘前缓存数据
-    pm_daily = premarket_memo.get('daily_kline_str', '暂无记录') if premarket_memo else '暂无记录'
-    pm_min10 = premarket_memo.get('min_kline_str', '暂无记录') if premarket_memo else '暂无记录'
-    pm_pre = premarket_memo.get('premarket_kline_str', '暂无记录') if premarket_memo else '暂无记录'
-    pm_opt = premarket_memo.get('option_str', '暂无记录') if premarket_memo else '暂无记录'
-    pm_temp = premarket_memo.get('temp_str', '暂无记录') if premarket_memo else '暂无记录'
-    pm_news = premarket_memo.get('news_str', '暂无记录') if premarket_memo else '暂无记录'
-
-    return event_header + (
+    return (
         f"🚨 **【突发盘面裁决警报】**：{symbol} 现价 ${current_price}，"
         f"已触击网格【{zone_name}】(触发价 ${trigger_price})！\n\n"
 
-        f"🏦 **【一、当前账户真实火力状态】** (⚠️ 裁决前必须过资金这关！)\n"
-        f"   - 💵 {money_str}\n"
-        f"   - 📦 **{symbol} 当前持仓**: {pos_str}\n\n"
-        f"   **其他标的持仓总览** (⚠️ 评估 55% 仓位上限时必须参考)：\n"
-        f"{all_positions_str}\n\n"
+        f"🏦 **【一、当前账户火力状态】**\n"
+        f"   💵 {ctx['money_str']}\n"
+        f"   📦 **{symbol} 当前持仓**: {ctx['pos_str']}\n\n"
+        f"   **持仓总览** (⚠️ 评估 55% 仓位上限时必须参考)：\n"
+        f"{ctx['all_positions_str']}\n\n"
 
         f"💭 **【你的盘前宏观记忆 (大局观锚点)】**：\n"
         f"> {macro_thesis}\n\n"
 
-        f"📚 **【二、 回顾盘前信息(战略底色)】**：\n"
-        f"ℹ️ 标的基本面：\n{static_str}\n\n"
-        f"📊 估值指标：\n{financials_str}\n\n"
-        f"📈 60日日K线与10分钟结构：\n{pm_daily}\n\n{pm_min10}\n\n"
-        f"🌅 美股盘前5分钟动能：\n{pm_pre}\n\n"
-        f"🌡️ 盘前历史温度与期权阵地：\n{pm_temp}\n\n{pm_opt}\n\n"
-        f"📰 盘前核心资讯：\n{pm_news}\n\n"
+        f"📚 **【二、回顾盘前信息(战略底色)】**\n"
+        f"ℹ️ 标的基本面：\n{ctx['static_str']}\n\n"
+        f"📊 估值指标：\n{ctx['financials_str']}\n\n"
+        f"{pm_review}\n\n"
 
-        f"🚨 **【三、 当日实时盘面(战术校准)】**：\n"
-        f"🌡️ 实时市场温度：{temperature_str}\n\n"
-        f"💰 实时主力资金分布：\n{flow_str}\n\n"
-        f"🛡️ 实时期权异动探针：\n{opt_str}\n\n"
-        f"🛒 **【今日相关订单】**：\n{today_orders_str}\n\n"
-        f"📈 **【今日 5 分钟微观全息数据】**：\n"
-        f"```\n{today_k_str}\n```\n\n"
-        f"📰 **【此时此刻最新突发资讯】**：\n"
-        f"{news_info}\n\n"
+        f"🚨 **【三、当日实时盘面(战术校准)】**\n"
+        f"{realtime}\n\n"
 
         f"⚠️ **【要求】**：\n"
         f"你现在的唯一任务是进行最终风控并重构阵地！**绝对禁止尝试调用任何外部工具！**\n"
         f"请严格遵守 Prompt 中对应状态的指令输出格式！"
+    )
+
+
+def build_order_event_message(
+    symbol: str,
+    current_price: float,
+    special_event_msg: str,
+    macro_thesis: str,
+    ctx: dict,
+    news_info: str,
+) -> str:
+    """将盘面数据组装为【订单状态变更重构】专用唤醒提示词"""
+    pm = ctx["premarket_memo"] or {}
+    pm_review = _build_premarket_review(pm)
+    realtime = _build_realtime_section(ctx, news_info)
+
+    return (
+        f"🔔 **【底层系统事件注入】**: {special_event_msg}\n\n"
+
+        f"📐 **【订单状态变更 · 网格重构请求】**：{symbol} 现价 ${current_price}\n\n"
+
+        f"🏦 **【一、最新账户状态】**\n"
+        f"   💵 {ctx['money_str']}\n"
+        f"   📦 **{symbol} 当前持仓**: {ctx['pos_str']}\n\n"
+        f"   **持仓总览** (⚠️ 评估 55% 仓位上限时必须参考)：\n"
+        f"{ctx['all_positions_str']}\n\n"
+
+        f"💭 **【你的盘前宏观记忆 (大局观锚点)】**：\n"
+        f"> {macro_thesis}\n\n"
+
+        f"📚 **【二、回顾盘前信息(战略底色)】**\n"
+        f"ℹ️ 标的基本面：\n{ctx['static_str']}\n\n"
+        f"📊 估值指标：\n{ctx['financials_str']}\n\n"
+        f"{pm_review}\n\n"
+
+        f"🚨 **【三、当日实时盘面(战术校准)】**\n"
+        f"{realtime}\n\n"
+
+        f"⚠️ **【要求】**：\n"
+        f"你现在的唯一任务是根据最新持仓与盘面重构交易网格！**绝对禁止尝试调用任何外部工具！**\n"
+        f"请严格按照 Prompt 要求输出 JSON 网格，禁止输出任何交易指令！"
     )
 
 
@@ -747,12 +566,12 @@ def call_ai(wake_msg: str, sys_prompt: str) -> str | None:
         return None
 
 
-def handle_ai_verdict(symbol: str, ai_reply: str):
+def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0):
     """
-    解析 AI 回复：
+    解析【网格触线裁决】的 AI 回复：
     1. 正则提取 [ACTION:...] 指令并执行下单
     2. 提取 ```json...``` 更新本地网格文件（含冷却时间写入）
-    3. 将 AI 原始分析报告推送到 TG
+    3. 将 AI 裁决报告推送到 TG Analysis 频道
     """
     # 用于捕获真实的订单ID
     generated_order_id = None
@@ -835,94 +654,176 @@ def handle_ai_verdict(symbol: str, ai_reply: str):
         # 降级：文件读取失败时原样推送，至少保证消息不丢失
         print(f"⚠️ 读取最终 PLAN_FILE 失败，降级推送原始 ai_reply: {e}")
 
-    # 标题根据裁决动作类型动态生成
+    # ── 构建 TG 推送消息（含裁决标签与价格信息）──
     if action_match:
         action_type = action_match.group(1)
+        reason_str = action_match.group(4) or ""
         if action_type == "BUY":
-            verdict_label = f"🟢 裁决：买入 (BUY)"
+            verdict_header = f"🟢 **买入裁决** ┃ **{symbol}** ┃ ${current_price}"
         elif action_type == "SELL":
-            verdict_label = f"🔴 裁决：卖出 (SELL)"
+            verdict_header = f"🔴 **卖出裁决** ┃ **{symbol}** ┃ ${current_price}"
         else:
-            verdict_label = f"⏸️ 裁决：观望 (HOLD)"
+            verdict_header = f"⏸️ **观望裁决** ┃ **{symbol}** ┃ ${current_price}"
     else:
-        verdict_label = "🦞 自动裁决"
+        verdict_header = f"🦞 **自动裁决** ┃ **{symbol}** ┃ ${current_price}"
+        reason_str = ""
 
-    tg_analysis(f"💭 **【{verdict_label}】 【📈 {symbol}】**\n{tg_reply}")
+    tg_parts = [verdict_header]
+    if zone_name:
+        tg_parts[0] += f" → {zone_name}"
+    tg_parts.append("━━━━━━━━━━━━━━━━━━━━━")
+    if reason_str:
+        tg_parts.append(f"📊 理由: {reason_str}")
+        tg_parts.append("━━━━━━━━━━━━━━━━━━━━━")
+    tg_parts.append(tg_reply)
+
+    tg_analysis("\n".join(tg_parts))
+
+
+def handle_rebuild_result(symbol: str, ai_reply: str):
+    """
+    解析【订单状态变更重构】的 AI 回复：
+    1. 提取 ```json...``` 全面吸收为新网格（不解析 ACTION 指令）
+    2. 将 AI 重构报告推送到 TG Analysis 频道
+    """
+    # 1. 更新本地网格文件（全面吸收 AI 新网格）
+    json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
+    if json_match:
+        try:
+            new_grid_data = json.loads(json_match.group(1))
+            with open(PLAN_FILE, "r", encoding="utf-8") as f:
+                latest_plan = json.load(f)
+
+            time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            if symbol in new_grid_data:
+                latest_plan[symbol] = new_grid_data[symbol]
+                latest_plan[symbol]["update_time"] = time_str
+                # cooldown_until 由 AI 在 JSON 中设定（rebuild prompt 要求）
+                # 如果 AI 未设定，给默认 30 分钟冷却
+                if "cooldown_until" not in latest_plan[symbol]:
+                    cooldown_until = (datetime.now() + timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S")
+                    latest_plan[symbol]["cooldown_until"] = cooldown_until
+
+            with open(PLAN_FILE, "w", encoding="utf-8") as f:
+                json.dump(latest_plan, f, ensure_ascii=False, indent=4)
+            print(f"✅ {symbol} 订单事件重构网格已落盘")
+
+        except json.JSONDecodeError as e:
+            print(f"❌ 重构 JSON 格式损坏: {e}")
+    else:
+        print(f"⚠️ AI 重构回复中未找到 JSON 代码块")
+
+    # 2. 推送到 TG — 使用落盘后的权威数据
+    tg_reply = ai_reply
+    try:
+        with open(PLAN_FILE, "r", encoding="utf-8") as f:
+            final_plan = json.load(f)
+        if symbol in final_plan:
+            canonical_json_str = json.dumps(
+                {symbol: final_plan[symbol]}, ensure_ascii=False, indent=2
+            )
+            tg_reply = re.sub(
+                r'```json\s*.*?\s*```',
+                f'```json\n{canonical_json_str}\n```',
+                ai_reply,
+                flags=re.DOTALL,
+            )
+    except Exception as e:
+        print(f"⚠️ 读取最终 PLAN_FILE 失败，降级推送原始 ai_reply: {e}")
+
+    tg_analysis(
+        f"📐 **网格重构完成** ┃ **{symbol}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{tg_reply}"
+    )
+
 
 # ===========================================================================
 # 🎯 核心触发层
 # ===========================================================================
 
-def process_zone_hit(symbol: str, data: dict, current_price: float, zone_name: str, zone_info: dict, special_event_msg: str = "", is_rebuild: bool = False):
+def process_grid_trigger(symbol: str, data: dict, current_price: float, zone_name: str, zone_info: dict):
     """
-    网格触线后的完整处理流程：
-    收集盘面数据 → 构建唤醒词 → 调用 AI → 执行裁决
+    【网格触线裁决】完整处理流程：
+    数据采集 → 构建唤醒词 → 发送 L5 通知 → 调用 AI → 执行裁决
     """
     trigger_price = float(zone_info["price"])
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 💥 捕获 {symbol} 异动，正在提取记忆与当日盘面...")
+    macro_thesis = data.get("macro_thesis", "未配置盘前宏观剧本，请仅依赖短期盘面判断。")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 💥 网格触线: {symbol} [{zone_name}]，正在采集盘面数据...")
 
-    # 各维度数据采集（独立函数，各自 try/except）
-    macro_thesis              = data.get("macro_thesis", "未配置盘前宏观剧本，请仅依赖短期盘面判断。")
-    money_str, pos_str, _, all_positions_str = fetch_account_status(symbol)
-    static_str               = fetch_static_info(symbol)
-    financials_str           = fetch_financial_indexes(symbol)
-    temperature_str          = fetch_market_temperature(symbol)
-    flow_str                  = fetch_capital_flow(symbol)
-    today_k_str, change_pct  = fetch_kline_data(symbol, current_price)
-    opt_str                   = fetch_option_snapshot(symbol, current_price)
-    today_orders_str          = fetch_today_orders(symbol)
+    # 1. 统一数据采集
+    ctx = _collect_market_data(symbol, current_price)
 
-    # 读取盘前数据缓存
-    premarket_memo_file = f"premarket_memo_{symbol.replace('.', '_')}.json"
-    premarket_memo = read_cache(premarket_memo_file)
-
-    # 新闻触发策略：
-    # - rebuild 场景（订单状态变更唤醒）：无条件拉取，确保 AI 掌握最新信息
-    # - 普通网格触及场景：波动超 2% 时才调用，节省 Tavily API 配额
-    if is_rebuild:
-        print(f"📰 {symbol} rebuild 场景，无条件触发 Tavily 新闻搜索...")
-        news_info = fetch_latest_news(symbol)
-    elif change_pct >= 2.0:
-        print(f"🚨 {symbol} 日内波动 {change_pct:.1f}% 达标，触发 Tavily 新闻搜索...")
+    # 2. 新闻策略：波动超 2% 时才调用，节省 Tavily API 配额
+    if ctx["change_pct"] >= 2.0:
+        print(f"🚨 {symbol} 日内波动 {ctx['change_pct']:.1f}% 达标，触发 Tavily 新闻搜索...")
         news_info = fetch_latest_news(symbol)
     else:
         news_info = "☑️ 日内未见异常基本面消息，纯技术面博弈。"
 
-    # 构建唤醒词
-    wake_msg = build_wake_message(
+    # 3. 构建网格触线专用唤醒词
+    wake_msg = build_grid_trigger_message(
         symbol=symbol,
         current_price=current_price,
         zone_name=zone_name,
         trigger_price=trigger_price,
         macro_thesis=macro_thesis,
-        money_str=money_str,
-        pos_str=pos_str,
-        all_positions_str=all_positions_str,
-        static_str=static_str,
-        financials_str=financials_str,
-        temperature_str=temperature_str,
-        flow_str=flow_str,
-        opt_str=opt_str,
-        today_orders_str=today_orders_str,
-        today_k_str=today_k_str,
+        ctx=ctx,
         news_info=news_info,
-        special_event_msg=special_event_msg,
-        premarket_memo=premarket_memo,
-        is_rebuild=is_rebuild,
     )
 
-    # 通知已接管（发往 Analysis 频道）
-    tg_analysis(f"🤖 **【L5 全自动接管】**\n哨兵已捕获 {symbol} 警报 ({zone_name})，现价 ${current_price}，已触及触发价 ${trigger_price}，正在后台隐形唤醒 🦞 进行裁决...")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] 💥 自动接管触发: {symbol}")
+    # 4. 通知已接管（仅网格触线时发送 L5 通知）
+    tg_analysis(
+        f"🤖 **L5 全自动接管** ┃ **{symbol}**\n"
+        f"━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📍 触发: {zone_name} ┃ 现价 ${current_price} ┃ 触发价 ${trigger_price}\n"
+        f"🦞 正在后台唤醒 AI 进行裁决..."
+    )
 
-    # 调用 AI 并处理裁决
-    sys_prompt = INTRADAY_REBUILD_PROMPT if is_rebuild else INTRADAY_SENTRY_PROMPT
-    ai_reply = call_ai(wake_msg, sys_prompt)
+    # 5. 调用 AI 并处理裁决
+    ai_reply = call_ai(wake_msg, INTRADAY_SENTRY_PROMPT)
     if ai_reply:
-        handle_ai_verdict(symbol, ai_reply)
+        handle_ai_verdict(symbol, ai_reply, zone_name=zone_name, current_price=current_price)
 
     # 防洪闸：处理完一只雷区股票强制冷却 60 秒
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 为防止 AI 接口限流，哨兵进入 60 秒战术冷却...")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 哨兵进入 60 秒战术冷却...")
+    time.sleep(60)
+
+
+def process_order_event(symbol: str, data: dict, current_price: float, special_event_msg: str):
+    """
+    【订单状态变更重构】完整处理流程：
+    数据采集 → 构建唤醒词 → 调用 AI → 全面吸收新网格
+    不发送 L5 接管通知，不执行下单操作。
+    """
+    macro_thesis = data.get("macro_thesis", "未配置盘前宏观剧本，请仅依赖短期盘面判断。")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] 📐 订单状态变更: {symbol}，正在采集盘面数据...")
+
+    # 1. 统一数据采集
+    ctx = _collect_market_data(symbol, current_price)
+
+    # 2. 新闻策略：订单事件场景无条件拉取，确保 AI 掌握最新信息
+    print(f"📰 {symbol} 订单事件场景，无条件触发 Tavily 新闻搜索...")
+    news_info = fetch_latest_news(symbol)
+
+    # 3. 构建订单事件专用唤醒词
+    wake_msg = build_order_event_message(
+        symbol=symbol,
+        current_price=current_price,
+        special_event_msg=special_event_msg,
+        macro_thesis=macro_thesis,
+        ctx=ctx,
+        news_info=news_info,
+    )
+
+    # 4. 调用 AI 并处理重构结果（不发 L5 通知，不解析 ACTION）
+    ai_reply = call_ai(wake_msg, INTRADAY_REBUILD_PROMPT)
+    if ai_reply:
+        handle_rebuild_result(symbol, ai_reply)
+
+    # 防洪闸
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 哨兵进入 60 秒战术冷却...")
     time.sleep(60)
 
 
@@ -1173,12 +1074,13 @@ def run_sentry():
                 # 阶段三：网格触线判定
                 hit, zone_name, zone_info = _check_zone_hit(data, current_price)
 
-                # 命中网格 or 强制唤醒 → 启动完整业务流
-                if hit or force_wakeup:
-                    if not hit:
-                        zone_name = "强制唤醒"
-                        zone_info = {"price": current_price}
-                    process_zone_hit(symbol, data, current_price, zone_name, zone_info, special_event_msg, is_rebuild=force_wakeup)
+                # 命中网格 or 强制唤醒 → 分流到对应处理流程
+                if force_wakeup:
+                    # 订单状态变更 → 重构网格（不下单）
+                    process_order_event(symbol, data, current_price, special_event_msg)
+                elif hit:
+                    # 网格触线 → AI 裁决（可能下单）
+                    process_grid_trigger(symbol, data, current_price, zone_name, zone_info)
 
         except Exception as e:
             print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚨 哨兵监控遭遇异常: {e}")
