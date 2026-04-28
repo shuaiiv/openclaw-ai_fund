@@ -58,7 +58,7 @@ TG_CHANNEL_ANALYSIS  = os.getenv("TG_CHANNEL_ID_ANALYSIS")
 TG_CHANNEL_ORDER     = os.getenv("TG_CHANNEL_ID_ORDER")
 TG_CHANNEL_ID        = TG_CHANNEL_ANALYSIS  # 向下兼容
 
-POLL_INTERVAL = 300  # 5分钟轮询
+POLL_INTERVAL = 120  # 2分钟轮询
 
 # 🚨 系统提示词
 PROMPT_SENTRY_FILE = os.path.join(_ROOT_DIR, "prompts", "intraday_sentry_prompt.md")
