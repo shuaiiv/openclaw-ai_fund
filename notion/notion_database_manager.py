@@ -2,6 +2,7 @@ from notion_client import Client
 import csv
 import os
 import datetime
+import logging
 
 from dotenv import load_dotenv, find_dotenv
 
@@ -22,7 +23,8 @@ def record_transaction(market: str, action: str, name: str, code: str, date: str
     ds_id = DB_TRANS_HK if market == "HK" else DB_TRANS_US
     try:
         # 1. 先写流水账
-        notion.pages.create(
+        logging.info(f"[流水] 开始写入: {market} {action} {code} x{amount} @{price}, fee={fee}")
+        trans_resp = notion.pages.create(
             parent={"type": "data_source_id", "data_source_id": ds_id},
             properties={
                 "Stock Name": {"title": [{"text": {"content": name}}]},
@@ -34,6 +36,7 @@ def record_transaction(market: str, action: str, name: str, code: str, date: str
                 "Trade Fee": {"number": float(fee)}
             }
         )
+        logging.info(f"[流水] 写入成功, page_id={trans_resp.get('id')}")
         
         # 2. 🚀 流水写入成功后，自动触发持仓更新逻辑！
         pos_result = update_position(market, name, code, action, amount, price, fee)
@@ -45,6 +48,7 @@ def record_transaction(market: str, action: str, name: str, code: str, date: str
             return {"status": "warning", "msg": f"⚠️ 流水记录成功，但持仓同步失败: {pos_result['msg']}"}
             
     except Exception as e:
+        logging.error(f"[流水] 写入失败: {str(e)}")
         return {"status": "error", "msg": f"❌ 流水记录失败: {str(e)}"}
 
 # ==========================================
@@ -87,8 +91,9 @@ def update_position(market: str, name: str, code: str, action: str, amount: int,
             if action == "Sell":
                  return {"status": "error", "msg": "没有持仓无法卖出！"}
             new_unit_price = ((amount * price) + fee) / amount
+            logging.info(f"[持仓] 新建仓位: {code}")
             notion.pages.create(
-                parent={"type": "data_source_id", "data_source_id": ds_id}, # 🎯 直接用你的 ID
+                parent={"type": "data_source_id", "data_source_id": ds_id},
                 properties={
                     "Stock Name": {"title": [{"text": {"content": name}}]},
                     "Stock Code": {"rich_text": [{"text": {"content": code}}]},
@@ -98,6 +103,7 @@ def update_position(market: str, name: str, code: str, action: str, amount: int,
             )
             return {"status": "success", "msg": f"已新建仓位: {code} 数量 {amount}, 均价 {new_unit_price:.2f}"}
     except Exception as e:
+        logging.error(f"[持仓] 更新失败: {str(e)}")
         return {"status": "error", "msg": str(e)}
 
 
