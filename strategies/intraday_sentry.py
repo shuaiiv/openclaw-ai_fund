@@ -25,6 +25,8 @@ from shared_utils import (
     fetch_static_info, fetch_financial_indexes, fetch_latest_news,
     # 期权数据
     fetch_option_snapshot,
+    # AI 调用 (带重试 / 限流排队)
+    call_ai_with_retry,
 )
 
 # ==========================================
@@ -542,28 +544,20 @@ def build_order_event_message(
 
 def call_ai(wake_msg: str, sys_prompt: str) -> str | None:
     """
-    将唤醒消息发送给本地 OpenClaw，返回 AI 回复文本，失败返回 None。
+    将唤醒消息发送给本地 OpenClaw，返回 AI 回复文本（内置 429 重试 + 限流排队），失败返回 None。
     """
-    try:
-        res = requests.post(
-            OPENCLAW_URL,
-            headers=OPENCLAW_HEADERS,
-            json={
-                "model": "openclaw/default",
-                "messages": [
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user",   "content": wake_msg},
-                ],
-            },
-            timeout=180,
-        )
-        if res.status_code == 200:
-            return res.json()["choices"][0]["message"]["content"]
-        tg_send(f"❌ 后台唤醒 AI 失败: HTTP {res.status_code}")
-        return None
-    except Exception as e:
-        tg_send(f"❌ 后台唤醒 AI 超时或异常: {e}")
-        return None
+    content, error = call_ai_with_retry(
+        messages=[
+            {"role": "system", "content": sys_prompt},
+            {"role": "user",   "content": wake_msg},
+        ],
+        timeout=180,
+        caller_label="盘中哨兵",
+    )
+    if content:
+        return content
+    tg_send(f"❌ 后台唤醒 AI 失败: {error}")
+    return None
 
 
 def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0):

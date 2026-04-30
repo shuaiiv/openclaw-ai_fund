@@ -376,3 +376,140 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
 
     except Exception as e:
         return f"期权数据暂不可用: {e}"
+
+
+# ==========================================================
+# 🤖 AI 调用 (带重试 / 限流排队)
+# ==========================================================
+#
+# 🏗️ 两层重试架构说明：
+#   第一层 (OpenClaw 内部)：OpenClaw 收到我们的请求后调用上游 LLM provider，
+#     如果 provider 返回 429，OpenClaw SDK 层会做短间隔重试（通常几秒级），
+#     但如果 Retry-After > 60s 则放弃并把 429 透传给我们。
+#   第二层 (本客户端)：我们收到 OpenClaw 返回的 429 时，说明它内部已经放弃了，
+#     此时做分钟级的长退避重试，等待 provider 配额窗口刷新后再尝试。
+#
+# ⚠️ 防雪崩措施：
+#   - 全局 threading.Lock 串行化请求，避免并发请求互相挤占配额
+#   - 随机抖动 (jitter ±25%)，防止盘前批量分析时多标的同步重试撞车
+#   - 只对 OpenClaw 已放弃的 429 做长退避，不与其内部短重试冲突
+
+import threading as _threading
+import random as _random
+
+# 全局互斥锁：同一时刻只允许一个 AI 请求在飞，避免并发请求导致 429 叠加
+_ai_call_lock = _threading.Lock()
+
+# 可重试的 HTTP 状态码
+_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+# 默认重试参数
+_MAX_RETRIES = 3          # 最多重试次数（不含首次请求）
+_BASE_BACKOFF_SEC = 60    # 首次重试基础等待秒数（429 场景通常需要较长等待）
+_MAX_BACKOFF_SEC = 360    # 单次最大等待秒数
+_JITTER_RATIO = 0.25      # 退避时间随机抖动幅度 (±25%)
+
+
+def _backoff_with_jitter(base: float) -> float:
+    """在 base 基础上添加 ±25% 随机抖动，防止多请求同步重试撞车"""
+    jitter = base * _JITTER_RATIO
+    return base + _random.uniform(-jitter, jitter)
+
+
+def call_ai_with_retry(
+    messages: list[dict],
+    *,
+    timeout: int = 360,
+    caller_label: str = "AI",
+) -> tuple[str | None, str | None]:
+    """
+    向 OpenClaw 发送 chat completion 请求，内置重试与限流排队。
+
+    参数:
+        messages     : OpenAI 兼容 messages 列表
+        timeout      : 单次请求超时秒数
+        caller_label : 日志/通知中使用的调用方标识
+
+    返回: (content, error_msg)
+        成功时 content 为 AI 回复文本, error_msg 为 None
+        失败时 content 为 None, error_msg 为可读错误描述
+
+    重试策略 (第二层 — 仅在 OpenClaw 内部重试放弃后触发):
+        - 遇到 429 / 5xx 状态码时自动重试，最多 _MAX_RETRIES 次
+        - 指数退避 + 随机抖动：~60s → ~120s → ~240s（受 _MAX_BACKOFF_SEC 上限约束）
+        - 优先尊重服务端 Retry-After 头（如有）
+        - 使用全局 threading.Lock 串行化请求，防止并发请求互相挤占配额
+    """
+    import time as _time
+
+    with _ai_call_lock:
+        last_error = ""
+        for attempt in range(_MAX_RETRIES + 1):  # 0 = 首次请求, 1..N = 重试
+            try:
+                res = requests.post(
+                    OPENCLAW_URL,
+                    headers=OPENCLAW_HEADERS,
+                    json={
+                        "model": "openclaw/default",
+                        "messages": messages,
+                    },
+                    timeout=timeout,
+                )
+
+                # ── 成功 ──
+                if res.status_code == 200:
+                    return res.json()["choices"][0]["message"]["content"], None
+
+                # ── 提取 OpenClaw 返回的错误详情（用于日志诊断） ──
+                error_detail = ""
+                try:
+                    body = res.json()
+                    error_detail = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
+                except Exception:
+                    pass
+
+                # ── 可重试错误 ──
+                if res.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES:
+                    # 计算退避时间（指数退避 + 随机抖动）
+                    raw_backoff = min(_BASE_BACKOFF_SEC * (2 ** attempt), _MAX_BACKOFF_SEC)
+
+                    # 尊重 Retry-After 头（秒数格式）
+                    retry_after = res.headers.get("Retry-After")
+                    if retry_after:
+                        try:
+                            raw_backoff = max(raw_backoff, int(retry_after))
+                        except (ValueError, TypeError):
+                            pass
+
+                    backoff = _backoff_with_jitter(raw_backoff)
+                    last_error = f"HTTP {res.status_code}"
+                    detail_suffix = f" ({error_detail})" if error_detail else ""
+                    print(
+                        f"⚠️ [{caller_label}] 请求返回 {res.status_code}{detail_suffix}，"
+                        f"{backoff:.0f}秒后重试 ({attempt + 1}/{_MAX_RETRIES})..."
+                    )
+                    _time.sleep(backoff)
+                    continue
+
+                # ── 不可重试的非 200 ──
+                detail_suffix = f" ({error_detail})" if error_detail else ""
+                return None, f"HTTP {res.status_code}{detail_suffix}"
+
+            except requests.exceptions.Timeout:
+                last_error = f"请求超时 ({timeout}s)"
+                if attempt < _MAX_RETRIES:
+                    backoff = _backoff_with_jitter(
+                        min(_BASE_BACKOFF_SEC * (2 ** attempt), _MAX_BACKOFF_SEC)
+                    )
+                    print(
+                        f"⚠️ [{caller_label}] 请求超时，"
+                        f"{backoff:.0f}秒后重试 ({attempt + 1}/{_MAX_RETRIES})..."
+                    )
+                    _time.sleep(backoff)
+                    continue
+
+            except Exception as e:
+                return None, f"异常: {e}"
+
+        # 所有重试均耗尽
+        return None, f"重试{_MAX_RETRIES}次后仍失败 (最后错误: {last_error})"

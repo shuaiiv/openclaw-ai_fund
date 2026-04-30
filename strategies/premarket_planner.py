@@ -31,6 +31,8 @@ from shared_utils import (
     fetch_latest_news,
     # 期权数据
     fetch_option_snapshot,
+    # AI 调用 (带重试 / 限流排队)
+    call_ai_with_retry,
 )
 
 # ==========================================
@@ -65,7 +67,7 @@ PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "premarket_planner_prompt.md")
 
 # 标的列表
 HK_SYMBOLS = ["0700.HK", "09988.HK", "01810.HK"]
-US_SYMBOLS = ["AAPL.US", "NVDA.US", "TSLA.US", "AMD.US", "GOOGL.US", "NBIS.US", "GLD.US"]
+US_SYMBOLS = ["NVDA.US", "TSLA.US", "GOOGL.US", "AMD.US", "AAPL.US", "NBIS.US", "GLD.US"]
 
 # 标的间隔 (秒)
 SYMBOL_INTERVAL = 300  # 5 分钟
@@ -620,27 +622,19 @@ def build_premarket_message(
 # ==========================================
 
 def call_ai(wake_msg: str) -> str | None:
-    """将唤醒消息发送给本地 OpenClaw，返回 AI 回复文本"""
-    try:
-        res = requests.post(
-            OPENCLAW_URL,
-            headers=OPENCLAW_HEADERS,
-            json={
-                "model": "openclaw/default",
-                "messages": [
-                    {"role": "system", "content": PREMARKET_PROMPT},
-                    {"role": "user",   "content": wake_msg},
-                ],
-            },
-            timeout=300,  # 盘前分析数据量大，给更多时间
-        )
-        if res.status_code == 200:
-            return res.json()["choices"][0]["message"]["content"]
-        tg_send(f"❌ 盘前谋划 AI 调用失败: HTTP {res.status_code}")
-        return None
-    except Exception as e:
-        tg_send(f"❌ 盘前谋划 AI 超时或异常: {e}")
-        return None
+    """将唤醒消息发送给本地 OpenClaw，返回 AI 回复文本（内置 429 重试 + 限流排队）"""
+    content, error = call_ai_with_retry(
+        messages=[
+            {"role": "system", "content": PREMARKET_PROMPT},
+            {"role": "user",   "content": wake_msg},
+        ],
+        timeout=300,  # 盘前分析数据量大，给更多时间
+        caller_label="盘前谋划",
+    )
+    if content:
+        return content
+    tg_send(f"❌ 盘前谋划 AI 调用失败: {error}")
+    return None
 
 
 def handle_ai_result(symbol: str, ai_reply: str):
