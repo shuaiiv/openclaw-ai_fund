@@ -1298,9 +1298,13 @@ def _logic_get_trading_days(market: str = "HK", start: str = None, end: str = No
         ctx = get_ctx()
         m = MARKET_MAP.get(market.upper(), Market.HK)
 
-        # end_d 也需要根据市场时区计算，否则港股深夜可能判断误差一天
-        tz_us = pytz.timezone("America/New_York")
-        local_today = datetime.now(tz_us).date() if market.upper() == "US" else datetime.now().date()
+        # end_d 需要根据市场时区计算，否则服务器跑在 UTC 时，港股凌晨0~8点会误判日期
+        if market.upper() == "US":
+            local_today = datetime.now(pytz.timezone("America/New_York")).date()
+        elif market.upper() == "HK":
+            local_today = datetime.now(pytz.timezone("Asia/Hong_Kong")).date()
+        else:
+            local_today = datetime.now().date()
 
         if not end:
             end_d = local_today
@@ -1320,13 +1324,15 @@ def _logic_get_trading_days(market: str = "HK", start: str = None, end: str = No
 
         trade_days = []
         half_days = set()
-        if hasattr(resp, 'half_trading_days'):
-            for d in resp.half_trading_days:
-                half_days.add(str(d))
-        if hasattr(resp, 'trading_days'):
-            for d in resp.trading_days:
-                ds = str(d)
-                trade_days.append({"date": ds, "is_half_day": ds in half_days})
+        # SDK Python 对象属性名与 protobuf 字段名一致，是 trade_day / half_trade_day
+        # 注意：不是 trading_days / half_trading_days！
+        half_attr = getattr(resp, 'half_trade_day', getattr(resp, 'half_trading_days', []))
+        for d in (half_attr or []):
+            half_days.add(str(d))
+        trade_attr = getattr(resp, 'trade_day', getattr(resp, 'trading_days', []))
+        for d in (trade_attr or []):
+            ds = str(d)
+            trade_days.append({"date": ds, "is_half_day": ds in half_days})
 
         is_today_trading = str(local_today) in [td['date'] for td in trade_days]
 

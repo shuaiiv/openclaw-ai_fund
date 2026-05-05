@@ -66,8 +66,8 @@ TG_CHANNEL_ID = os.getenv("TG_CHANNEL_ID_ANALYSIS")
 PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "premarket_planner_prompt.md")
 
 # 标的列表
-HK_SYMBOLS = ["0700.HK", "09988.HK", "01810.HK"]
-US_SYMBOLS = ["NVDA.US", "TSLA.US", "GOOGL.US", "AMD.US", "AAPL.US", "NBIS.US", "GLD.US"]
+HK_SYMBOLS = ["0700.HK", "09988.HK", "01810.HK", "00100.HK", "02513.HK", "06082.HK"]
+US_SYMBOLS = ["NVDA.US", "TSLA.US", "GOOGL.US", "AMD.US", "AAPL.US", "GLD.US", "MU.US", "SNDK.US"]
 
 # 标的间隔 (秒)
 SYMBOL_INTERVAL = 300  # 5 分钟
