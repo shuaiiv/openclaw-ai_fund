@@ -41,6 +41,8 @@ from shared_utils import (
 from longbridge_server import (
     _logic_get_trading_days,                  # Step 0: 交易日查询
     get_account_asset,                        # Step 1: 账户持仓与购买力
+    _logic_get_live_quote,                    # 常规盘实时报价
+    _logic_get_extended_quote,                # 含盘前/盘后的最新价格
     _logic_get_market_temperature,            # Step 2: 当前市场温度
     _logic_get_market_temperature_history,    # Step 2: 历史市场温度
     _logic_get_static_info,                   # Step 3: 标的基本信息
@@ -67,7 +69,7 @@ PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "premarket_planner_prompt.md")
 
 # 标的列表
 HK_SYMBOLS = ["0700.HK", "09988.HK", "01810.HK", "00100.HK", "02513.HK", "06082.HK"]
-US_SYMBOLS = ["NVDA.US", "TSLA.US", "GOOGL.US", "AMD.US", "AAPL.US", "GLD.US", "MU.US", "SNDK.US"]
+US_SYMBOLS = ["NVDA.US", "TSLA.US", "GOOGL.US", "AMD.US", "AAPL.US", "MU.US", "SNDK.US", "INTC.US", "GLD.US"]
 
 # 标的间隔 (秒)
 SYMBOL_INTERVAL = 300  # 5 分钟
@@ -446,32 +448,51 @@ def fetch_min10_kline(symbol: str) -> str:
     if not cached:
         return "短周期K线数据为空"
 
-    # 美股只保留常规盘中数据：09:30-16:00 美东时间
+    # 美股：按美东时间分段标注（盘前/盘中/盘后），保留完整延伸时段数据
     if market == "US":
-        import pytz
         et = pytz.timezone("America/New_York")
-        filtered = []
+        sections = []
+        current_session = None
+        count = 0
+
         for k in cached:
             try:
                 t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
-                # K 线时间戳转为美东时间
                 t_et = pytz.utc.localize(t).astimezone(et)
                 h, m = t_et.hour, t_et.minute
-                # 筛选 09:30-15:59（常规盘）
-                if (h == 9 and m >= 30) or (10 <= h <= 14) or (h == 15):
-                    filtered.append(k)
+                time_str = t_et.strftime("%m-%d %H:%M")
+
+                if h < 4:
+                    continue  # 夜盘，忽略
+                elif h < 9 or (h == 9 and m < 30):
+                    session = "🌅 盘前"
+                elif h < 16:
+                    session = "📈 盘中"
+                elif h < 20:
+                    session = "🌙 盘后"
+                else:
+                    continue
+
+                if session != current_session:
+                    sections.append(f"--- {session} ---")
+                    current_session = session
+
+                sections.append(f"{time_str} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}")
+                count += 1
             except Exception:
-                filtered.append(k)  # 解析失败时保留
-        display_data = filtered
-    else:
-        display_data = cached
+                sections.append(f"{k['t']} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}")
+                count += 1
 
-    # 格式化输出
-    lines = [f"📈 近3个交易日10分钟K线 ({len(display_data)}条):"]
+        lines = [f"📈 近3个交易日10分钟K线 ({count}条，含盘前/盘后):"]
+        lines.append("时间(美东) | 开 | 高 | 低 | 收 | 成交量")
+        lines.extend(sections[-180:])
+        return "\n".join(lines)
+
+    # 非美股：直接输出全量
+    lines = [f"📈 近3个交易日10分钟K线 ({len(cached)}条):"]
     lines.append("时间 | 开 | 高 | 低 | 收 | 成交量")
-    for k in display_data[-120:]:  # 10分钟线 3 天内最多 120 条
+    for k in cached[-120:]:
         lines.append(f"{k['t']} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}")
-
     return "\n".join(lines)
 
 
@@ -560,6 +581,8 @@ def build_premarket_message(
     premarket_kline_str: str,
     option_str: str,
     news_str: str,
+    current_price: float = 0.0,
+    price_session: str = "",
 ) -> str:
     """将所有盘面数据组装成发给 AI 的完整盘前分析提示词"""
 
@@ -570,9 +593,20 @@ def build_premarket_message(
         f"{premarket_kline_str}\n\n"
     ) if premarket_kline_str else ""
 
+    # 实时价格行（标注时段来源，让 AI 明确知道这是盘前/盘后价格）
+    _mkt_tz = pytz.timezone("America/New_York") if market == "US" else pytz.timezone("Asia/Hong_Kong")
+    _session_labels = {"pre_market": "盘前", "post_market": "盘后", "regular": "盘中", "over_night": "夜盘"}
+    session_tag = _session_labels.get(price_session, "")
+    if current_price > 0:
+        mkt_time_str = datetime.now(_mkt_tz).strftime("%H:%M %Z")
+        price_line = f"💲 **当前实时价格: ${current_price:.2f}** ({session_tag} {mkt_time_str})\n"
+    else:
+        price_line = ""
+
     return (
         f"📋 **【盘前谋划数据投喂】** {symbol} ({market}股)\n"
-        f"⏰ 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+        f"⏰ 生成时间: {datetime.now(_mkt_tz).strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
+        f"{price_line}\n"
 
         f"{'='*50}\n"
         f"🏦 **一、账户状态**\n"
@@ -722,10 +756,23 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
             print(f"  📡 Step 5b: 获取美股盘前 5min K 线...")
             premarket_kline_str = fetch_premarket_kline_us(symbol)
 
+        # Step 5c: 获取当前实时价格（美股用 extended_quote 获取盘前/盘后价）
+        current_price = 0.0
+        if market == "US":
+            price_result = _logic_get_extended_quote(symbol)
+        else:
+            price_result = _logic_get_live_quote(symbol)
+        if "error" not in price_result:
+            current_price = price_result["price"]
+            session_info = price_result.get("session", "regular")
+            print(f"  📡 Step 5c: 当前价格 ${current_price:.2f} (session: {session_info})")
+        else:
+            print(f"  ⚠️ Step 5c: 实时价格获取失败: {price_result.get('error')}")
+
         # Step 6: 期权数据
         print(f"  📡 Step 6/8: 获取期权数据...")
         # 富途 API 支持港股和美股期权，统一调用；内部已有完整容错
-        option_str = fetch_option_snapshot(symbol, current_price=0)
+        option_str = fetch_option_snapshot(symbol, current_price=current_price)
 
         # Step 7: 最新资讯
         print(f"  📡 Step 7/8: 获取最新资讯...")
@@ -745,6 +792,8 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
             premarket_kline_str=premarket_kline_str,
             option_str=option_str,
             news_str=news_str,
+            current_price=current_price,
+            price_session=price_result.get("session", "") if current_price > 0 else "",
         )
 
         # Step 8.5: 缓存盘前所有数据，供盘中使用
@@ -848,11 +897,11 @@ def main():
     schedule.every().thursday.at("08:30").do(run_premarket_batch, market="HK")
     schedule.every().friday.at("08:30").do(run_premarket_batch, market="HK")
 
-    schedule.every().monday.at("20:30").do(run_premarket_batch, market="US")
-    schedule.every().tuesday.at("20:30").do(run_premarket_batch, market="US")
-    schedule.every().wednesday.at("20:30").do(run_premarket_batch, market="US")
-    schedule.every().thursday.at("20:30").do(run_premarket_batch, market="US")
-    schedule.every().friday.at("20:30").do(run_premarket_batch, market="US")
+    schedule.every().monday.at("20:00").do(run_premarket_batch, market="US")
+    schedule.every().tuesday.at("20:00").do(run_premarket_batch, market="US")
+    schedule.every().wednesday.at("20:00").do(run_premarket_batch, market="US")
+    schedule.every().thursday.at("20:00").do(run_premarket_batch, market="US")
+    schedule.every().friday.at("20:00").do(run_premarket_batch, market="US")
 
     # tg_send("🌅 盘前谋划调度器已上线，等待触发时间...")
 

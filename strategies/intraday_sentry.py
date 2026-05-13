@@ -35,7 +35,8 @@ from shared_utils import (
 # ==========================================
 from longbridge_server import (
     get_account_asset,                  # 获取账户购买力与持仓
-    _logic_get_live_quote,              # 获取单只股票实时行情
+    _logic_get_live_quote,              # 获取单只股票实时行情（常规盘）
+    _logic_get_extended_quote,          # 获取含盘前/盘后的最新价格
     _logic_get_capital_distribution,    # 获取主力资金分布
     _logic_get_history_kline,           # 获取历史 K 线 (返回 dict 列表)
     _logic_get_market_temperature,      # 获取市场温度
@@ -105,7 +106,9 @@ _US_TZ = "America/New_York"
 
 # 交易时段定义（每个元素: ((start_h, start_m), (end_h, end_m))）
 _HK_SESSIONS = [((9, 30), (12, 0)), ((13, 0), (16, 0))]   # 港股 上午+下午
-_US_SESSIONS = [((9, 30), (15, 59)), ((16, 0), (20, 0))]   # 美股 盘中(09:30-15:59) + 盘后(16:00-20:00)
+_US_REGULAR_SESSIONS    = [((9, 30), (15, 59))]             # 美股 盘中(09:30-15:59)
+_US_AFTERHOURS_SESSIONS = [((16, 0), (20, 0))]             # 美股 盘后(16:00-20:00)
+_US_SESSIONS = _US_REGULAR_SESSIONS + _US_AFTERHOURS_SESSIONS  # 合并（用于休眠计算）
 
 # 交易日缓存（每日只查询一次 API）
 _trading_day_cache: dict = {"date": None, "hk": None, "us": None}
@@ -157,12 +160,13 @@ def _seconds_to_next_session(tz_name: str, sessions: list) -> int:
     return 0  # 今日所有时段已结束
 
 
-def _get_market_status() -> tuple[bool, bool, int]:
+def _get_market_status() -> tuple[bool, bool, bool, int]:
     """
     智能市场状态检测：基于 trading_days API + 精确交易时段判断。
 
-    返回: (hk_active, us_active, sleep_seconds)
+    返回: (hk_active, us_active, us_after_hours, sleep_seconds)
       - 任意市场活跃 → sleep_seconds = 0
+      - us_after_hours: True 表示美股当前处于盘后时段（需用 extended_quote 获取实时价）
       - 无市场活跃 → sleep_seconds = 距下一个时段的秒数
     """
     hk_trading = _check_trading_day("HK")
@@ -170,9 +174,10 @@ def _get_market_status() -> tuple[bool, bool, int]:
 
     hk_active = hk_trading and _is_in_session(_HK_TZ, _HK_SESSIONS)
     us_active = us_trading and _is_in_session(_US_TZ, _US_SESSIONS)
+    us_after_hours = us_active and _is_in_session(_US_TZ, _US_AFTERHOURS_SESSIONS)
 
     if hk_active or us_active:
-        return hk_active, us_active, 0
+        return hk_active, us_active, us_after_hours, 0
 
     # 计算距下一个交易时段的秒数
     candidates = []
@@ -186,10 +191,10 @@ def _get_market_status() -> tuple[bool, bool, int]:
             candidates.append(s)
 
     if candidates:
-        return False, False, min(candidates)
+        return False, False, False, min(candidates)
 
     # 两个市场今日均不开市或已收盘，1小时后重新检查
-    return False, False, 3600
+    return False, False, False, 3600
 
 
 # ===========================================================================
@@ -373,14 +378,20 @@ def fetch_today_orders(symbol: str) -> str:
 
 def fetch_kline_data(symbol: str, current_price: float) -> tuple[str, float]:
     """
-    获取当天全量 5 分钟 K 线。
+    获取当天全量 5 分钟 K 线（含盘前/盘后延伸时段）。
+    对美股标的按美东时间拆分为：盘前(04:00-09:29) / 盘中(09:30-15:59) / 盘后(16:00-20:00)，
+    分段标注后输出，让 AI 能清晰区分各时段走势。
     返回: (today_k_str, price_change_pct)
     """
     try:
         today_date = datetime.now().date()
         k_lines = _logic_get_history_kline(symbol, Period.Min_5, today_date, today_date)
 
-        if k_lines and "error" not in k_lines[0]:
+        if not k_lines or "error" in k_lines[0]:
+            return "今日暂无 K 线数据（可能刚开盘）", 0.0
+
+        # 非美股：直接输出全量（港股无延伸时段）
+        if not symbol.endswith(".US"):
             day_open = k_lines[0]["o"]
             price_change_pct = abs((current_price - day_open) / day_open) * 100
             k_data_list = [
@@ -389,7 +400,61 @@ def fetch_kline_data(symbol: str, current_price: float) -> tuple[str, float]:
             ]
             return "\n".join(k_data_list), price_change_pct
 
-        return "今日暂无 K 线数据（可能刚开盘）", 0.0
+        # 美股：按美东时间分段
+        et = pytz.timezone("America/New_York")
+        premarket, regular, afterhours = [], [], []
+
+        for k in k_lines:
+            try:
+                t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
+                t_et = pytz.utc.localize(t).astimezone(et)
+                h, m = t_et.hour, t_et.minute
+                line = f"{t_et.strftime('%H:%M')} | O:{k['o']} H:{k['h']} L:{k['l']} C:{k['c']} V:{k['v']}"
+                if h < 4:
+                    pass  # 夜盘，忽略
+                elif h < 9 or (h == 9 and m < 30):
+                    premarket.append(line)
+                elif h < 16:
+                    regular.append(line)
+                elif h < 20:
+                    afterhours.append(line)
+            except Exception:
+                regular.append(
+                    f"{k['t']} | O:{k['o']} H:{k['h']} L:{k['l']} C:{k['c']} V:{k['v']}"
+                )
+
+        # 涨跌幅以常规盘开盘价为基准（如果有），否则用首根 K 线
+        day_open = k_lines[0]["o"]
+        if regular:
+            # 从第一根常规盘 K 线提取开盘价
+            first_regular_k = None
+            for k in k_lines:
+                try:
+                    t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
+                    t_et = pytz.utc.localize(t).astimezone(et)
+                    if (t_et.hour == 9 and t_et.minute >= 30) or t_et.hour >= 10:
+                        first_regular_k = k
+                        break
+                except Exception:
+                    continue
+            if first_regular_k:
+                day_open = first_regular_k["o"]
+        price_change_pct = abs((current_price - day_open) / day_open) * 100
+
+        # 组装分段输出
+        sections = []
+        if premarket:
+            sections.append(f"🌅 盘前 ({len(premarket)}条):")
+            sections.extend(premarket)
+        if regular:
+            sections.append(f"📈 盘中 ({len(regular)}条):")
+            sections.extend(regular)
+        if afterhours:
+            sections.append(f"🌙 盘后 ({len(afterhours)}条):")
+            sections.extend(afterhours)
+
+        return "\n".join(sections) if sections else "今日暂无 K 线数据", price_change_pct
+
     except Exception as e:
         return f"当日K线拉取失败: {e}", 0.0
 
@@ -470,9 +535,15 @@ def build_grid_trigger_message(
     pm_review = _build_premarket_review(pm)
     realtime = _build_realtime_section(ctx, news_info)
 
+    # 市场时区时间戳
+    _mkt_tz = pytz.timezone("America/New_York") if symbol.endswith(".US") else pytz.timezone("Asia/Hong_Kong")
+    mkt_now = datetime.now(_mkt_tz)
+    time_header = f"⏰ 触发时间: {mkt_now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+
     return (
         f"🚨 **【突发盘面裁决警报】**：{symbol} 现价 ${current_price}，"
-        f"已触击网格【{zone_name}】(触发价 ${trigger_price})！\n\n"
+        f"已触击网格【{zone_name}】(触发价 ${trigger_price})！\n"
+        f"{time_header}\n\n"
 
         f"🏦 **【一、当前账户火力状态】**\n"
         f"   💵 {ctx['money_str']}\n"
@@ -510,8 +581,14 @@ def build_order_event_message(
     pm_review = _build_premarket_review(pm)
     realtime = _build_realtime_section(ctx, news_info)
 
+    # 市场时区时间戳
+    _mkt_tz = pytz.timezone("America/New_York") if symbol.endswith(".US") else pytz.timezone("Asia/Hong_Kong")
+    mkt_now = datetime.now(_mkt_tz)
+    time_header = f"⏰ 事件时间: {mkt_now.strftime('%Y-%m-%d %H:%M:%S %Z')}"
+
     return (
-        f"🔔 **【底层系统事件注入】**: {special_event_msg}\n\n"
+        f"🔔 **【底层系统事件注入】**: {special_event_msg}\n"
+        f"{time_header}\n\n"
 
         f"📐 **【订单状态变更 · 网格重构请求】**：{symbol} 现价 ${current_price}\n\n"
 
@@ -1006,7 +1083,7 @@ def run_sentry():
     while True:
         try:
             # 1. 市场状态检测（基于 trading_days API + 精确交易时段）
-            hk_active, us_active, sleep_seconds = _get_market_status()
+            hk_active, us_active, us_after_hours, sleep_seconds = _get_market_status()
 
             if sleep_seconds > 0:
                 hrs, remainder = divmod(sleep_seconds, 3600)
@@ -1024,9 +1101,9 @@ def run_sentry():
                 continue
 
             active_markets = []
-            if hk_active: active_markets.append("🇭🇰港")
-            if us_active: active_markets.append("🇺🇸美")
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🟢 {'/'.join(active_markets)}股盘中，执行 {POLL_INTERVAL // 60} 分钟例行扫描...")
+            if hk_active: active_markets.append("🇭🇰港股")
+            if us_active: active_markets.append("🇺🇸美股盘后" if us_after_hours else "🇺🇸美股")
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] 🟢 {' / '.join(active_markets)}，执行 {POLL_INTERVAL // 60} 分钟例行扫描...")
 
             # 2. 读取作战计划
             plan = _load_plan()
@@ -1035,14 +1112,19 @@ def run_sentry():
                 continue
 
             # 3. 批量拉取实时价格（只拉当前活跃市场的标的）
+            #    ⚠️ 盘后时段使用 extended_quote 获取盘后实时价，避免 last_done 停留在收盘价
             live_prices: dict[str, float] = {}
             for sym in plan.keys():
-                # 按市场过滤：美股只在盘中扫描，港股只在港股开盘时扫描
+                # 按市场过滤：港股只在港股开盘时扫描，美股只在美股时段扫描
                 if sym.endswith(".HK") and not hk_active:
                     continue
                 if sym.endswith(".US") and not us_active:
                     continue
-                result = _logic_get_live_quote(sym)
+                # 盘后时段：必须用 extended_quote 获取 post_market_quote 中的实时价
+                if sym.endswith(".US") and us_after_hours:
+                    result = _logic_get_extended_quote(sym)
+                else:
+                    result = _logic_get_live_quote(sym)
                 if "error" not in result:
                     live_prices[sym] = result["price"]
 
