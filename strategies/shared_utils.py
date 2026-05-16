@@ -419,6 +419,7 @@ def _backoff_with_jitter(base: float) -> float:
 def call_ai_with_retry(
     messages: list[dict],
     *,
+    max_tokens: int = 8192,
     timeout: int = 360,
     caller_label: str = "AI",
 ) -> tuple[str | None, str | None]:
@@ -427,12 +428,15 @@ def call_ai_with_retry(
 
     参数:
         messages     : OpenAI 兼容 messages 列表
+        max_tokens   : AI 回复的最大 token 数（防截断，默认 8192）
         timeout      : 单次请求超时秒数
         caller_label : 日志/通知中使用的调用方标识
 
     返回: (content, error_msg)
         成功时 content 为 AI 回复文本, error_msg 为 None
         失败时 content 为 None, error_msg 为可读错误描述
+        ⚠️ 若 AI 回复被截断 (finish_reason=length)，content 仍会返回（截断的内容），
+           同时 error_msg 会包含截断警告信息，调用方应检查 error_msg 以决定是否重试或告警。
 
     重试策略 (第二层 — 仅在 OpenClaw 内部重试放弃后触发):
         - 遇到 429 / 5xx 状态码时自动重试，最多 _MAX_RETRIES 次
@@ -452,13 +456,27 @@ def call_ai_with_retry(
                     json={
                         "model": "openclaw/default",
                         "messages": messages,
+                        "max_tokens": max_tokens,
                     },
                     timeout=timeout,
                 )
 
                 # ── 成功 ──
                 if res.status_code == 200:
-                    return res.json()["choices"][0]["message"]["content"], None
+                    resp_body = res.json()
+                    content = resp_body["choices"][0]["message"]["content"]
+                    finish_reason = resp_body["choices"][0].get("finish_reason", "stop")
+
+                    if finish_reason == "length":
+                        # AI 回复被截断：仍返回已有内容，但通过 error_msg 告警
+                        warn = (
+                            f"⚠️ [{caller_label}] AI 回复被截断 (finish_reason=length, "
+                            f"max_tokens={max_tokens})，输出不完整！"
+                        )
+                        print(warn)
+                        return content, warn
+
+                    return content, None
 
                 # ── 提取 OpenClaw 返回的错误详情（用于日志诊断） ──
                 error_detail = ""

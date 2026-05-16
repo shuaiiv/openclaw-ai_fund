@@ -662,10 +662,14 @@ def call_ai(wake_msg: str) -> str | None:
             {"role": "system", "content": PREMARKET_PROMPT},
             {"role": "user",   "content": wake_msg},
         ],
-        timeout=300,  # 盘前分析数据量大，给更多时间
+        max_tokens=16384,  # 盘前分析数据量大，给更多输出空间
+        timeout=300,       # 盘前分析数据量大，给更多时间
         caller_label="盘前谋划",
     )
     if content:
+        if error:
+            # finish_reason=length 截断警告：内容已返回但不完整
+            tg_send(f"⚠️ 盘前谋划 AI 回复被截断: {error}")
         return content
     tg_send(f"❌ 盘前谋划 AI 调用失败: {error}")
     return None

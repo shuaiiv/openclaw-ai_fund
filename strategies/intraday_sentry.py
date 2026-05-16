@@ -628,10 +628,14 @@ def call_ai(wake_msg: str, sys_prompt: str) -> str | None:
             {"role": "system", "content": sys_prompt},
             {"role": "user",   "content": wake_msg},
         ],
+        max_tokens=8192,   # 盘中裁决输出空间
         timeout=180,
         caller_label="盘中哨兵",
     )
     if content:
+        if error:
+            # finish_reason=length 截断警告：内容已返回但不完整
+            tg_send(f"⚠️ 盘中哨兵 AI 回复被截断: {error}")
         return content
     tg_send(f"❌ 后台唤醒 AI 失败: {error}")
     return None
