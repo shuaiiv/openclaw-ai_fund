@@ -422,7 +422,7 @@ def call_ai_with_retry(
     max_tokens: int = 8192,
     timeout: int = 360,
     caller_label: str = "AI",
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, dict | None]:
     """
     向 OpenClaw 发送 chat completion 请求，内置重试与限流排队。
 
@@ -432,9 +432,12 @@ def call_ai_with_retry(
         timeout      : 单次请求超时秒数
         caller_label : 日志/通知中使用的调用方标识
 
-    返回: (content, error_msg)
+    返回: (content, error_msg, metadata)
         成功时 content 为 AI 回复文本, error_msg 为 None
         失败时 content 为 None, error_msg 为可读错误描述
+        metadata 为包含模型名称和 Token 用量的字典:
+            {"model": str, "prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
+            失败时 metadata 为 None
         ⚠️ 若 AI 回复被截断 (finish_reason=length)，content 仍会返回（截断的内容），
            同时 error_msg 会包含截断警告信息，调用方应检查 error_msg 以决定是否重试或告警。
 
@@ -467,6 +470,18 @@ def call_ai_with_retry(
                     content = resp_body["choices"][0]["message"]["content"]
                     finish_reason = resp_body["choices"][0].get("finish_reason", "stop")
 
+                    # 提取模型名称和 Token 用量元数据
+                    usage = resp_body.get("usage", {})
+                    raw_model = resp_body.get("model", "unknown")
+                    # OpenClaw 网关回显请求时的 alias（如 "openclaw/default"），
+                    # 真实上游模型由 Agent 面板配置（含 fallback），此处如实记录。
+                    metadata = {
+                        "model": raw_model,
+                        "prompt_tokens": usage.get("prompt_tokens", 0),
+                        "completion_tokens": usage.get("completion_tokens", 0),
+                        "total_tokens": usage.get("total_tokens", 0),
+                    }
+
                     if finish_reason == "length":
                         # AI 回复被截断：仍返回已有内容，但通过 error_msg 告警
                         warn = (
@@ -474,9 +489,9 @@ def call_ai_with_retry(
                             f"max_tokens={max_tokens})，输出不完整！"
                         )
                         print(warn)
-                        return content, warn
+                        return content, warn, metadata
 
-                    return content, None
+                    return content, None, metadata
 
                 # ── 提取 OpenClaw 返回的错误详情（用于日志诊断） ──
                 error_detail = ""
@@ -511,7 +526,7 @@ def call_ai_with_retry(
 
                 # ── 不可重试的非 200 ──
                 detail_suffix = f" ({error_detail})" if error_detail else ""
-                return None, f"HTTP {res.status_code}{detail_suffix}"
+                return None, f"HTTP {res.status_code}{detail_suffix}", None
 
             except requests.exceptions.Timeout:
                 last_error = f"请求超时 ({timeout}s)"
@@ -527,7 +542,7 @@ def call_ai_with_retry(
                     continue
 
             except Exception as e:
-                return None, f"异常: {e}"
+                return None, f"异常: {e}", None
 
         # 所有重试均耗尽
-        return None, f"重试{_MAX_RETRIES}次后仍失败 (最后错误: {last_error})"
+        return None, f"重试{_MAX_RETRIES}次后仍失败 (最后错误: {last_error})", None

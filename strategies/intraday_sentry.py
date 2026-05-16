@@ -619,11 +619,11 @@ def build_order_event_message(
 # 🤖 AI 交互层
 # ===========================================================================
 
-def call_ai(wake_msg: str, sys_prompt: str) -> str | None:
+def call_ai(wake_msg: str, sys_prompt: str) -> tuple[str | None, dict | None]:
     """
-    将唤醒消息发送给本地 OpenClaw，返回 AI 回复文本（内置 429 重试 + 限流排队），失败返回 None。
+    将唤醒消息发送给本地 OpenClaw，返回 (AI 回复文本, 元数据)（内置 429 重试 + 限流排队），失败返回 (None, None)。
     """
-    content, error = call_ai_with_retry(
+    content, error, metadata = call_ai_with_retry(
         messages=[
             {"role": "system", "content": sys_prompt},
             {"role": "user",   "content": wake_msg},
@@ -636,12 +636,12 @@ def call_ai(wake_msg: str, sys_prompt: str) -> str | None:
         if error:
             # finish_reason=length 截断警告：内容已返回但不完整
             tg_send(f"⚠️ 盘中哨兵 AI 回复被截断: {error}")
-        return content
+        return content, metadata
     tg_send(f"❌ 后台唤醒 AI 失败: {error}")
-    return None
+    return None, None
 
 
-def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0):
+def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0, metadata: dict | None = None):
     """
     解析【网格触线裁决】的 AI 回复：
     1. 正则提取 [ACTION:...] 指令并执行下单
@@ -674,6 +674,7 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
                 generated_order_id = order_res["order_id"]
 
     # 2. 更新本地网格文件
+    ai_model_name = None  # 从 AI 输出的 JSON 中提取真实模型名
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -690,6 +691,8 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
             time_str = dt_now.strftime("%Y-%m-%d %H:%M:%S")
 
             if symbol in new_grid_data:
+                # 提取 AI 自报的模型名（不写入 plan 文件）
+                ai_model_name = new_grid_data[symbol].pop("_ai_model", None)
                 if not traded:
                     # 如果未发生交易 (HOLD) 或属于盘中网格重构 (rebuild_prompt)，则全面吸收 AI 提供的网格
                     latest_plan[symbol] = new_grid_data[symbol]
@@ -752,16 +755,32 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
         tg_parts.append("━━━━━━━━━━━━━━━━━━━━━")
     tg_parts.append(tg_reply)
 
+    # 附加 AI 元数据尾注（模型名称 + Token 用量）
+    meta_parts = []
+    if ai_model_name:
+        meta_parts.append(f"🤖 模型: {ai_model_name}")
+    if metadata:
+        meta_parts.append(
+            f"📊 Token: "
+            f"输入 {metadata.get('prompt_tokens', 0):,} + "
+            f"输出 {metadata.get('completion_tokens', 0):,} = "
+            f"合计 {metadata.get('total_tokens', 0):,}"
+        )
+    if meta_parts:
+        tg_parts.append("━━━━━━━━━━━━━━━━━━━━━")
+        tg_parts.append("\n".join(meta_parts))
+
     tg_analysis("\n".join(tg_parts))
 
 
-def handle_rebuild_result(symbol: str, ai_reply: str):
+def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = None):
     """
     解析【订单状态变更重构】的 AI 回复：
     1. 提取 ```json...``` 全面吸收为新网格（不解析 ACTION 指令）
     2. 将 AI 重构报告推送到 TG Analysis 频道
     """
     # 1. 更新本地网格文件（全面吸收 AI 新网格）
+    ai_model_name = None  # 从 AI 输出的 JSON 中提取真实模型名
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -772,6 +791,8 @@ def handle_rebuild_result(symbol: str, ai_reply: str):
             time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if symbol in new_grid_data:
+                # 提取 AI 自报的模型名（不写入 plan 文件）
+                ai_model_name = new_grid_data[symbol].pop("_ai_model", None)
                 latest_plan[symbol] = new_grid_data[symbol]
                 latest_plan[symbol]["update_time"] = time_str
                 # cooldown_until 由 AI 在 JSON 中设定（rebuild prompt 要求）
@@ -807,10 +828,26 @@ def handle_rebuild_result(symbol: str, ai_reply: str):
     except Exception as e:
         print(f"⚠️ 读取最终 PLAN_FILE 失败，降级推送原始 ai_reply: {e}")
 
+    # 构建 AI 元数据尾注
+    meta_parts = []
+    if ai_model_name:
+        meta_parts.append(f"🤖 模型: {ai_model_name}")
+    if metadata:
+        meta_parts.append(
+            f"📊 Token: "
+            f"输入 {metadata.get('prompt_tokens', 0):,} + "
+            f"输出 {metadata.get('completion_tokens', 0):,} = "
+            f"合计 {metadata.get('total_tokens', 0):,}"
+        )
+    meta_footer = ""
+    if meta_parts:
+        meta_footer = "\n━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(meta_parts)
+
     tg_analysis(
         f"📐 **网格重构完成** ┃ **{symbol}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"{tg_reply}"
+        f"{meta_footer}"
     )
 
 
@@ -857,9 +894,9 @@ def process_grid_trigger(symbol: str, data: dict, current_price: float, zone_nam
     )
 
     # 5. 调用 AI 并处理裁决
-    ai_reply = call_ai(wake_msg, INTRADAY_SENTRY_PROMPT)
+    ai_reply, ai_metadata = call_ai(wake_msg, INTRADAY_SENTRY_PROMPT)
     if ai_reply:
-        handle_ai_verdict(symbol, ai_reply, zone_name=zone_name, current_price=current_price)
+        handle_ai_verdict(symbol, ai_reply, zone_name=zone_name, current_price=current_price, metadata=ai_metadata)
 
     # 防洪闸：处理完一只雷区股票强制冷却 60 秒
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 哨兵进入 60 秒战术冷却...")
@@ -893,9 +930,9 @@ def process_order_event(symbol: str, data: dict, current_price: float, special_e
     )
 
     # 4. 调用 AI 并处理重构结果（不发 L5 通知，不解析 ACTION）
-    ai_reply = call_ai(wake_msg, INTRADAY_REBUILD_PROMPT)
+    ai_reply, ai_metadata = call_ai(wake_msg, INTRADAY_REBUILD_PROMPT)
     if ai_reply:
-        handle_rebuild_result(symbol, ai_reply)
+        handle_rebuild_result(symbol, ai_reply, metadata=ai_metadata)
 
     # 防洪闸
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 哨兵进入 60 秒战术冷却...")

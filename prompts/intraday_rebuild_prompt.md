@@ -80,6 +80,7 @@
 >
 > * `update_time` 格式为 `"YYYY-MM-DD HH:MM:SS"`，例如 `"2026-04-20 15:30:00"`
 > * `cooldown_until` 格式相同
+> * **`_ai_model` 字段必填**：填写你的真实模型全名（含供应商前缀），例如 `"google/gemini-3.1-pro-preview"`。请如实填写，禁止编造。
 
 ```json
 {
@@ -88,6 +89,7 @@
     "cooldown_until": "2026-04-20 16:30:00",
     "macro_thesis": "【盘中重塑】刚完成抄底建仓，盘口放量确认支撑有效。30日极值165-185，上升通道延续。下一步观察185突破动能。",
     "update_time": "2026-04-20 15:30:00",
+    "_ai_model": "google/gemini-3.1-pro-preview",
     "zones": {
       "take_profit": {"price": 195.0, "condition": ">=", "action": "SELL", "reason": "触及通道上轨，分批止盈"},
       "buy_oversold": {"price": 162.0, "condition": "<=", "action": "BUY", "reason": "情绪错杀跌至价值区间，左侧逢低加仓"},

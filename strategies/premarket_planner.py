@@ -655,9 +655,9 @@ def build_premarket_message(
 # 🤖 AI 交互层
 # ==========================================
 
-def call_ai(wake_msg: str) -> str | None:
-    """将唤醒消息发送给本地 OpenClaw，返回 AI 回复文本（内置 429 重试 + 限流排队）"""
-    content, error = call_ai_with_retry(
+def call_ai(wake_msg: str) -> tuple[str | None, dict | None]:
+    """将唤醒消息发送给本地 OpenClaw，返回 (AI 回复文本, 元数据)（内置 429 重试 + 限流排队）"""
+    content, error, metadata = call_ai_with_retry(
         messages=[
             {"role": "system", "content": PREMARKET_PROMPT},
             {"role": "user",   "content": wake_msg},
@@ -670,18 +670,19 @@ def call_ai(wake_msg: str) -> str | None:
         if error:
             # finish_reason=length 截断警告：内容已返回但不完整
             tg_send(f"⚠️ 盘前谋划 AI 回复被截断: {error}")
-        return content
+        return content, metadata
     tg_send(f"❌ 盘前谋划 AI 调用失败: {error}")
-    return None
+    return None, None
 
 
-def handle_ai_result(symbol: str, ai_reply: str):
+def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
     """
     解析 AI 回复：
     1. 提取 ```json...``` 更新 daily_trading_plan.json
     2. 推送 AI 分析报告到 TG
     """
     # 1. 提取并更新 JSON
+    ai_model_name = None  # 从 AI 输出的 JSON 中提取真实模型名
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -691,6 +692,8 @@ def handle_ai_result(symbol: str, ai_reply: str):
             time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if symbol in new_grid:
+                # 提取 AI 自报的模型名（不写入 plan 文件）
+                ai_model_name = new_grid[symbol].pop("_ai_model", None)
                 plan[symbol] = new_grid[symbol]
                 plan[symbol]["update_time"] = time_str
                 # 清除旧的 cooldown 和 pending_order（盘前重铸，盘中状态机重新开始）
@@ -707,18 +710,36 @@ def handle_ai_result(symbol: str, ai_reply: str):
         print(f"⚠️ AI 未返回 JSON 代码块")
         tg_send(f"⚠️ {symbol} 盘前谋划 AI 未返回网格 JSON")
 
+    # 构建 AI 元数据尾注（模型名称 + Token 用量）
+    meta_parts = []
+    if ai_model_name:
+        meta_parts.append(f"🤖 模型: {ai_model_name}")
+    if metadata:
+        meta_parts.append(
+            f"📊 Token: "
+            f"输入 {metadata.get('prompt_tokens', 0):,} + "
+            f"输出 {metadata.get('completion_tokens', 0):,} = "
+            f"合计 {metadata.get('total_tokens', 0):,}"
+        )
+    meta_footer = ""
+    if meta_parts:
+        meta_footer = "\n━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(meta_parts)
+
     # 2. 推送 AI 分析报告
     prefix = f"💭 **盘前策略报告** ┃ **{symbol}**\n━━━━━━━━━━━━━━━━━━━━━\n"
+    full_content = ai_reply + meta_footer
     max_safe = 4000  # 内容最大字符数（含前缀不超过 4096）
-    if len(prefix) + len(ai_reply) <= max_safe:
-        tg_send(prefix + ai_reply)
+    if len(prefix) + len(full_content) <= max_safe:
+        tg_send(prefix + full_content)
     else:
         # 分段发送，每次确保 prefix + chunk 不超过 max_safe
         chunk_size = max_safe - len(prefix)
+        # 元数据尾注附加在最后一段
         chunks = [ai_reply[i:i+chunk_size] for i in range(0, len(ai_reply), chunk_size)]
         for i, chunk in enumerate(chunks):
             header = prefix if i == 0 else f"💭 **盘前策略报告** ┃ **{symbol}** (续 {i+1})\n━━━━━━━━━━━━━━━━━━━━━\n"
-            tg_send(header + chunk)
+            content = chunk + (meta_footer if i == len(chunks) - 1 else "")
+            tg_send(header + content)
 
 
 # ==========================================
@@ -817,10 +838,10 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
         # Step 8+9: 推送 AI
         print(f"  🤖 推送给 AI 分析...")
         tg_send(f"⏳ 正在分析 ┃ **{symbol}** ┃ {market_name}")
-        ai_reply = call_ai(wake_msg)
+        ai_reply, ai_metadata = call_ai(wake_msg)
 
         if ai_reply:
-            handle_ai_result(symbol, ai_reply)
+            handle_ai_result(symbol, ai_reply, metadata=ai_metadata)
         else:
             tg_send(f"❌ {symbol} 盘前谋划 AI 无响应")
 
