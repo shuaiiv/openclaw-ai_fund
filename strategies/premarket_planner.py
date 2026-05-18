@@ -69,7 +69,7 @@ PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "premarket_planner_prompt.md")
 
 # 标的列表
 HK_SYMBOLS = ["0700.HK", "09988.HK", "01810.HK", "00100.HK", "02513.HK", "06082.HK"]
-US_SYMBOLS = ["NVDA.US", "TSLA.US", "GOOGL.US", "AMD.US", "AAPL.US", "MU.US", "SNDK.US", "INTC.US", "GLD.US"]
+US_SYMBOLS = ["NVDA.US", "TSLA.US", "GOOGL.US", "AMD.US", "AAPL.US", "INTC.US", "MU.US", "SNDK.US", "DRAM.US", "GLD.US"]
 
 # 标的间隔 (秒)
 SYMBOL_INTERVAL = 300  # 5 分钟
@@ -922,11 +922,11 @@ def main():
     schedule.every().thursday.at("08:30").do(run_premarket_batch, market="HK")
     schedule.every().friday.at("08:30").do(run_premarket_batch, market="HK")
 
-    schedule.every().monday.at("20:00").do(run_premarket_batch, market="US")
-    schedule.every().tuesday.at("20:00").do(run_premarket_batch, market="US")
-    schedule.every().wednesday.at("20:00").do(run_premarket_batch, market="US")
-    schedule.every().thursday.at("20:00").do(run_premarket_batch, market="US")
-    schedule.every().friday.at("20:00").do(run_premarket_batch, market="US")
+    schedule.every().monday.at("20:15").do(run_premarket_batch, market="US")
+    schedule.every().tuesday.at("20:15").do(run_premarket_batch, market="US")
+    schedule.every().wednesday.at("20:15").do(run_premarket_batch, market="US")
+    schedule.every().thursday.at("20:15").do(run_premarket_batch, market="US")
+    schedule.every().friday.at("20:15").do(run_premarket_batch, market="US")
 
     # tg_send("🌅 盘前谋划调度器已上线，等待触发时间...")
 
