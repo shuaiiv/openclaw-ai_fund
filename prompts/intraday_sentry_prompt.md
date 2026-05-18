@@ -100,7 +100,7 @@
 * 编写 JSON 时必须使用 Markdown 的 ` ```json ... ``` ` 代码块！
 
 > **⚠️ 只输出当前被触发的单个标的的 JSON。`update_time` 格式为 `"YYYY-MM-DD HH:MM:SS"`。**
-> **`_ai_model` 字段必填**：填写你的真实模型全名（含供应商前缀），例如 `"google/gemini-3.1-pro-preview"`。请如实填写，禁止编造。
+> **`_ai_model` 字段必填**：填写你的真实模型全名（含供应商/渠道前缀）。请如实填写你在系统中看到的完整模型标识，禁止编造。
 
 ```json
 {
@@ -108,7 +108,7 @@
     "status": "已持仓 100股 (成本 $170)",
     "macro_thesis": "【盘前记忆】30日极值165-185。大级别上升通道。情绪错杀坚决买入；跌破 155 认输出局。【盘中更新】buy_dip 网格在 178 附近形成长下影线缩量，判断为诱空，已上移抄底价至 175。",
     "update_time": "2026-04-20 14:30:00",
-    "_ai_model": "google/gemini-3.1-pro-preview",
+    "_ai_model": "<你的真实模型全名>",
     "zones": {
       "take_profit": {"price": 195.0, "condition": ">=", "action": "SELL", "reason": "触及通道上轨压力，分批止盈"},
       "buy_oversold": {"price": 175.0, "condition": "<=", "action": "BUY", "reason": "回调至 20日均线支撑，左侧摊薄"},

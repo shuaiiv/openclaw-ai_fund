@@ -77,7 +77,7 @@
 | `macro_thesis` | ✅ | 你的核心策略记忆锚点，用"【盘前记忆】"开头。包含30日极值范围和你的核心判断逻辑。这段文字会在盘中作为你的"大局观参考"反复呈现给你。 |
 | `update_time` | ✅ | 当前时间戳，格式为 `"YYYY-MM-DD HH:MM:SS"`，例如 `"2026-04-20 08:30:00"` |
 | `zones` | ✅ | 网格交易区间对象 |
-| `_ai_model` | ✅ | 你的真实模型全名（含供应商前缀），例如 `"google/gemini-3.1-pro-preview"` 或 `"anthropic/claude-sonnet-4-20250514"`。请如实填写，禁止编造。 |
+| `_ai_model` | ✅ | 你的真实模型全名（含供应商/渠道前缀）。请如实填写你在系统中看到的完整模型标识，禁止编造。 |
 
 ### zones 可用区间类型
 
@@ -137,7 +137,7 @@
     "status": "已持仓 100股 (成本 $170)",
     "macro_thesis": "【盘前记忆】30日极值165-185。大级别上升通道。情绪错杀坚决买入；跌破 155 认输出局。",
     "update_time": "2026-04-03 08:30:00",
-    "_ai_model": "google/gemini-3.1-pro-preview",
+    "_ai_model": "<你的真实模型全名>",
     "zones": {
       "take_profit": {"price": 195.0, "condition": ">=", "action": "SELL", "reason": "触及通道上轨压力，分批止盈"},
       "add_position": {"price": 185.0, "condition": ">=", "action": "BUY", "reason": "放量突破平台，右侧顺势加仓"},
