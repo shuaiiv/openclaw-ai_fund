@@ -35,6 +35,7 @@ from shared_utils import (
     call_ai_with_retry,
     # AI 元数据格式化
     format_ai_meta_footer,
+    resolve_ai_model_name,
 )
 
 # ==========================================
@@ -684,7 +685,7 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
     2. 推送 AI 分析报告到 TG
     """
     # 1. 提取并更新 JSON
-    ai_model_name = None  # 从 AI 输出的 JSON 中提取真实模型名
+    ai_model_name = None  # 从 AI 输出的 JSON 中提取模型名 → 用 metadata 修正
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -694,8 +695,12 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
             time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if symbol in new_grid:
-                # 提取 AI 自报的模型名（不写入 plan 文件）
-                ai_model_name = new_grid[symbol].pop("_ai_model", None)
+                # 提取 AI 自报模型名 → 用 metadata 修正为准确值
+                raw_ai_model = new_grid[symbol].pop("_ai_model", None)
+                ai_model_name = resolve_ai_model_name(raw_ai_model, metadata)
+                # 写回准确的模型标识到 plan JSON
+                if ai_model_name:
+                    new_grid[symbol]["_ai_model"] = ai_model_name
                 plan[symbol] = new_grid[symbol]
                 plan[symbol]["update_time"] = time_str
                 # 清除旧的 cooldown 和 pending_order（盘前重铸，盘中状态机重新开始）
@@ -704,6 +709,17 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
 
             save_plan(plan)
             print(f"✅ {symbol} 网格已更新到 daily_trading_plan.json")
+
+            # 用准确的 JSON 替换 ai_reply 中的原始 JSON 代码块
+            canonical_json = json.dumps(
+                {symbol: plan.get(symbol, {})}, ensure_ascii=False, indent=2
+            )
+            ai_reply = re.sub(
+                r'```json\s*.*?\s*```',
+                f'```json\n{canonical_json}\n```',
+                ai_reply,
+                flags=re.DOTALL,
+            )
 
         except json.JSONDecodeError as e:
             print(f"❌ AI 返回的 JSON 格式损坏: {e}")

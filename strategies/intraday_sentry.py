@@ -29,6 +29,7 @@ from shared_utils import (
     call_ai_with_retry,
     # AI 元数据格式化
     format_ai_meta_footer,
+    resolve_ai_model_name,
 )
 
 # ==========================================
@@ -676,7 +677,7 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
                 generated_order_id = order_res["order_id"]
 
     # 2. 更新本地网格文件
-    ai_model_name = None  # 从 AI 输出的 JSON 中提取真实模型名
+    ai_model_name = None  # 从 AI 输出的 JSON 中提取模型名 → 用 metadata 修正
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -693,8 +694,12 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
             time_str = dt_now.strftime("%Y-%m-%d %H:%M:%S")
 
             if symbol in new_grid_data:
-                # 提取 AI 自报的模型名（不写入 plan 文件）
-                ai_model_name = new_grid_data[symbol].pop("_ai_model", None)
+                # 提取 AI 自报模型名 → 用 metadata 修正为准确值
+                raw_ai_model = new_grid_data[symbol].pop("_ai_model", None)
+                ai_model_name = resolve_ai_model_name(raw_ai_model, metadata)
+                # 写回准确的模型标识到 plan JSON
+                if ai_model_name:
+                    new_grid_data[symbol]["_ai_model"] = ai_model_name
                 if not traded:
                     # 如果未发生交易 (HOLD) 或属于盘中网格重构 (rebuild_prompt)，则全面吸收 AI 提供的网格
                     latest_plan[symbol] = new_grid_data[symbol]
@@ -772,7 +777,7 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
     2. 将 AI 重构报告推送到 TG Analysis 频道
     """
     # 1. 更新本地网格文件（全面吸收 AI 新网格）
-    ai_model_name = None  # 从 AI 输出的 JSON 中提取真实模型名
+    ai_model_name = None  # 从 AI 输出的 JSON 中提取模型名 → 用 metadata 修正
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -783,8 +788,12 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
             time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
             if symbol in new_grid_data:
-                # 提取 AI 自报的模型名（不写入 plan 文件）
-                ai_model_name = new_grid_data[symbol].pop("_ai_model", None)
+                # 提取 AI 自报模型名 → 用 metadata 修正为准确值
+                raw_ai_model = new_grid_data[symbol].pop("_ai_model", None)
+                ai_model_name = resolve_ai_model_name(raw_ai_model, metadata)
+                # 写回准确的模型标识到 plan JSON
+                if ai_model_name:
+                    new_grid_data[symbol]["_ai_model"] = ai_model_name
                 latest_plan[symbol] = new_grid_data[symbol]
                 latest_plan[symbol]["update_time"] = time_str
                 # cooldown_until 由 AI 在 JSON 中设定（rebuild prompt 要求）

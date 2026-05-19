@@ -529,12 +529,37 @@ def _call_openai_compatible(
     return None, f"重试{_MAX_RETRIES}次后仍失败 (最后错误: {last_error})", None
 
 
+def resolve_ai_model_name(ai_self_report: str | None, metadata: dict | None) -> str | None:
+    """
+    根据 channel 选择准确的模型标识。
+
+    - OpenClaw 链路：信任 AI 自报 _ai_model（网关有身份注入，准确）
+    - NewAPI 链路：AI 自报不可靠，使用 metadata 中的 provider/name 构造准确值
+
+    返回: 准确的模型标识字符串（如 "Vertex_AI/gemini-3.1-pro-preview"），
+          无数据时返回 None。
+    """
+    if not metadata:
+        return ai_self_report  # 无 metadata 时只能用 AI 自报
+
+    channel = metadata.get("channel", "")
+    if channel == "OpenClaw" and ai_self_report:
+        return ai_self_report
+
+    # NewAPI 或其他：用 API metadata 构造准确值
+    provider = metadata.get("provider", "")
+    name = metadata.get("name", "")
+    if provider and name:
+        return f"{provider}/{name}"
+    return name or ai_self_report
+
+
 def format_ai_meta_footer(ai_model_name: str | None, metadata: dict | None) -> str:
     """
     格式化 AI 元数据尾注（channel / provider / name + Token 用量）。
 
     参数:
-        ai_model_name : AI 在 JSON 中自报的模型名（_ai_model 字段），OpenClaw 链路优先使用
+        ai_model_name : resolve_ai_model_name() 的返回值（准确的模型标识）
         metadata      : call_ai_with_retry 返回的 metadata dict
 
     返回: 带分隔线的完整尾注字符串，无数据时返回空字符串。
@@ -549,9 +574,6 @@ def format_ai_meta_footer(ai_model_name: str | None, metadata: dict | None) -> s
     parts: list[str] = []
 
     # 通道 + 提供商/模型 信息行
-    # ⚠️ 选择数据源的关键：按 channel 决定信谁
-    #   OpenClaw: 网关注入了模型身份上下文，AI 自报 _ai_model 可靠
-    #   NewAPI:   直连无身份注入，AI 自报不可靠，只信 API 返回的 metadata
     channel = metadata.get("channel", "N/A")
     provider = metadata.get("provider", "")
     model_name = metadata.get("name", "")
