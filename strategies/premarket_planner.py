@@ -33,6 +33,8 @@ from shared_utils import (
     fetch_option_snapshot,
     # AI 调用 (带重试 / 限流排队)
     call_ai_with_retry,
+    # AI 元数据格式化
+    format_ai_meta_footer,
 )
 
 # ==========================================
@@ -710,20 +712,7 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
         print(f"⚠️ AI 未返回 JSON 代码块")
         tg_send(f"⚠️ {symbol} 盘前谋划 AI 未返回网格 JSON")
 
-    # 构建 AI 元数据尾注（模型名称 + Token 用量）
-    meta_parts = []
-    if ai_model_name:
-        meta_parts.append(f"🤖 模型: {ai_model_name}")
-    if metadata:
-        meta_parts.append(
-            f"📊 Token: "
-            f"输入 {metadata.get('prompt_tokens', 0):,} + "
-            f"输出 {metadata.get('completion_tokens', 0):,} = "
-            f"合计 {metadata.get('total_tokens', 0):,}"
-        )
-    meta_footer = ""
-    if meta_parts:
-        meta_footer = "\n━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(meta_parts)
+    meta_footer = format_ai_meta_footer(ai_model_name, metadata)
 
     # 2. 推送 AI 分析报告
     prefix = f"💭 **盘前策略报告** ┃ **{symbol}**\n━━━━━━━━━━━━━━━━━━━━━\n"

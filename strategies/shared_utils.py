@@ -379,20 +379,17 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
 
 
 # ==========================================================
-# 🤖 AI 调用 (带重试 / 限流排队)
+# 🤖 AI 调用 (带重试 / 限流排队 / 多通道降级)
 # ==========================================================
 #
-# 🏗️ 两层重试架构说明：
-#   第一层 (OpenClaw 内部)：OpenClaw 收到我们的请求后调用上游 LLM provider，
-#     如果 provider 返回 429，OpenClaw SDK 层会做短间隔重试（通常几秒级），
-#     但如果 Retry-After > 60s 则放弃并把 429 透传给我们。
-#   第二层 (本客户端)：我们收到 OpenClaw 返回的 429 时，说明它内部已经放弃了，
-#     此时做分钟级的长退避重试，等待 provider 配额窗口刷新后再尝试。
+# 🏗️ 架构说明：
+#   _call_openai_compatible  — 通用底层引擎，适配任何 OpenAI 兼容端点
+#   _call_openclaw / _call_new_api — 薄包装，提供各自的 URL/Header/Model
+#   call_ai_with_retry       — 入口方法，按优先级列表依次尝试，失败降级
 #
 # ⚠️ 防雪崩措施：
 #   - 全局 threading.Lock 串行化请求，避免并发请求互相挤占配额
 #   - 随机抖动 (jitter ±25%)，防止盘前批量分析时多标的同步重试撞车
-#   - 只对 OpenClaw 已放弃的 429 做长退避，不与其内部短重试冲突
 
 import threading as _threading
 import random as _random
@@ -416,6 +413,266 @@ def _backoff_with_jitter(base: float) -> float:
     return base + _random.uniform(-jitter, jitter)
 
 
+
+# ----------------------------------------------------------
+# 🔧 通用 OpenAI 兼容端点调用引擎（内部方法）
+# ----------------------------------------------------------
+
+def _call_openai_compatible(
+    *,
+    url: str,
+    headers: dict,
+    model: str,
+    messages: list[dict],
+    max_tokens: int,
+    timeout: int,
+    caller_label: str,
+) -> tuple[str | None, str | None, dict | None]:
+    """
+    向任意 OpenAI Chat Completions 兼容端点发送请求，内置重试与退避。
+
+    调用方须在 _ai_call_lock 外部自行加锁（或由上层入口统一加锁）。
+    本方法 **不** 获取 _ai_call_lock，以支持入口方法跨通道降级时共享同一把锁。
+
+    返回: (content, error_msg, metadata)
+    """
+    import time as _time
+
+    last_error = ""
+    for attempt in range(_MAX_RETRIES + 1):
+        try:
+            res = requests.post(
+                url,
+                headers=headers,
+                json={
+                    "model": model,
+                    "messages": messages,
+                    "max_tokens": max_tokens,
+                },
+                timeout=timeout,
+            )
+
+            # ── 成功 ──
+            if res.status_code == 200:
+                resp_body = res.json()
+                content = resp_body["choices"][0]["message"]["content"]
+                finish_reason = resp_body["choices"][0].get("finish_reason", "stop")
+
+                usage = resp_body.get("usage", {})
+                raw_model = resp_body.get("model", model)
+                metadata = {
+                    "name": raw_model,
+                    "prompt_tokens": usage.get("prompt_tokens", 0),
+                    "completion_tokens": usage.get("completion_tokens", 0),
+                    "total_tokens": usage.get("total_tokens", 0),
+                }
+
+                if finish_reason == "length":
+                    warn = (
+                        f"⚠️ [{caller_label}] AI 回复被截断 (finish_reason=length, "
+                        f"max_tokens={max_tokens})，输出不完整！"
+                    )
+                    print(warn)
+                    return content, warn, metadata
+
+                return content, None, metadata
+
+            # ── 提取错误详情 ──
+            error_detail = ""
+            try:
+                body = res.json()
+                error_detail = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
+            except Exception:
+                pass
+
+            # ── 可重试错误 ──
+            if res.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES:
+                raw_backoff = min(_BASE_BACKOFF_SEC * (2 ** attempt), _MAX_BACKOFF_SEC)
+
+                retry_after = res.headers.get("Retry-After")
+                if retry_after:
+                    try:
+                        raw_backoff = max(raw_backoff, int(retry_after))
+                    except (ValueError, TypeError):
+                        pass
+
+                backoff = _backoff_with_jitter(raw_backoff)
+                last_error = f"HTTP {res.status_code}"
+                detail_suffix = f" ({error_detail})" if error_detail else ""
+                print(
+                    f"⚠️ [{caller_label}] 请求返回 {res.status_code}{detail_suffix}，"
+                    f"{backoff:.0f}秒后重试 ({attempt + 1}/{_MAX_RETRIES})..."
+                )
+                _time.sleep(backoff)
+                continue
+
+            # ── 不可重试的非 200 ──
+            detail_suffix = f" ({error_detail})" if error_detail else ""
+            return None, f"HTTP {res.status_code}{detail_suffix}", None
+
+        except requests.exceptions.Timeout:
+            last_error = f"请求超时 ({timeout}s)"
+            if attempt < _MAX_RETRIES:
+                backoff = _backoff_with_jitter(
+                    min(_BASE_BACKOFF_SEC * (2 ** attempt), _MAX_BACKOFF_SEC)
+                )
+                print(
+                    f"⚠️ [{caller_label}] 请求超时，"
+                    f"{backoff:.0f}秒后重试 ({attempt + 1}/{_MAX_RETRIES})..."
+                )
+                _time.sleep(backoff)
+                continue
+
+        except Exception as e:
+            return None, f"异常: {e}", None
+
+    return None, f"重试{_MAX_RETRIES}次后仍失败 (最后错误: {last_error})", None
+
+
+def format_ai_meta_footer(ai_model_name: str | None, metadata: dict | None) -> str:
+    """
+    格式化 AI 元数据尾注（channel / provider / name + Token 用量）。
+
+    参数:
+        ai_model_name : AI 在 JSON 中自报的模型名（_ai_model 字段），OpenClaw 链路优先使用
+        metadata      : call_ai_with_retry 返回的 metadata dict
+
+    返回: 带分隔线的完整尾注字符串，无数据时返回空字符串。
+          格式示例:
+          ━━━━━━━━━━━━━━━━━━━━━
+          📡 通道: NewAPI | 提供商: Vertex_AI | 模型: gemini-3.1-pro-preview
+          📊 Token: 输入 81 + 输出 604 = 合计 685
+    """
+    if not metadata:
+        return ""
+
+    parts: list[str] = []
+
+    # 通道 + 提供商/模型 信息行
+    # ⚠️ 选择数据源的关键：按 channel 决定信谁
+    #   OpenClaw: 网关注入了模型身份上下文，AI 自报 _ai_model 可靠
+    #   NewAPI:   直连无身份注入，AI 自报不可靠，只信 API 返回的 metadata
+    channel = metadata.get("channel", "N/A")
+    provider = metadata.get("provider", "")
+    model_name = metadata.get("name", "")
+    if channel == "OpenClaw" and ai_model_name:
+        # OpenClaw 链路：AI 自报的提供商/模型名更可靠
+        parts.append(f"📡 通道: {channel} | 🤖 模型: {ai_model_name}")
+    elif provider:
+        # NewAPI 链路（或 OpenClaw 无自报时）：使用显式传入的提供商 + API 返回的模型名
+        parts.append(f"📡 通道: {channel} | 提供商: {provider} | 模型: {model_name}")
+    else:
+        parts.append(f"📡 通道: {channel} | 模型: {model_name}")
+
+    # Token 用量行
+    parts.append(
+        f"📊 Token: "
+        f"输入 {metadata.get('prompt_tokens', 0):,} + "
+        f"输出 {metadata.get('completion_tokens', 0):,} = "
+        f"合计 {metadata.get('total_tokens', 0):,}"
+    )
+
+    return "\n━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(parts)
+
+
+# ----------------------------------------------------------
+# 📡 Channel 薄包装
+# ----------------------------------------------------------
+#
+# metadata 统一字段命名：
+#   channel  — 调用链路 (OpenClaw / NewAPI)
+#   provider — 模型提供商 (Vertex_AI / Google / ...)
+#   name     — 模型名 (gemini-3.1-pro-preview / ...)
+
+def _call_openclaw(messages, *, max_tokens, timeout, caller_label):
+    """OpenClaw 网关通道（provider 和 name 由 AI 自报 _ai_model 字段提供）"""
+    content, error, metadata = _call_openai_compatible(
+        url=OPENCLAW_URL,
+        headers=OPENCLAW_HEADERS,
+        model="openclaw/default",
+        messages=messages,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        caller_label=f"{caller_label}|OpenClaw",
+    )
+    if metadata:
+        metadata["channel"] = "OpenClaw"
+        # provider/name 由下游从 AI 回复 JSON 的 _ai_model 字段提取，此处不设定
+    return content, error, metadata
+
+
+# ----------------------------------------------------------
+# 🌐 New-API 多提供商配置
+# ----------------------------------------------------------
+# new-api 通过不同的 api-key 区分渠道/提供商。
+# 每个提供商一条配置，新增渠道只需：
+#   1. 在 .env 中添加对应的 API key（如 NEW_API_KEY_OPENAI=sk-xxx）
+#   2. 在 _NEW_API_PROVIDERS 中添加一条配置
+#   3. 在 _AI_PROVIDER_CHAIN 中添加对应的降级条目
+
+NEW_API_BASE_URL = os.getenv("NEW_API_BASE_URL", "http://127.0.0.1:23000/v1")
+
+_NEW_API_PROVIDERS = {
+    "Vertex_AI": {
+        "api_key": os.getenv("NEW_API_KEY_Vertex_AI", ""),
+        "model": "gemini-3.1-pro-preview",
+    },
+    # 扩展示例（取消注释并在 .env 中配置即可启用）：
+    # "OpenAI": {
+    #     "api_key": os.getenv("NEW_API_KEY_OPENAI", ""),
+    #     "model": "gpt-4o",
+    # },
+}
+
+
+def _call_new_api(messages, *, max_tokens, timeout, caller_label, provider="Vertex_AI"):
+    """
+    VPS new-api 通道。
+    provider: 提供商名称，对应 _NEW_API_PROVIDERS 中的 key。
+              不同提供商使用不同的 api-key 和模型。
+    """
+    cfg = _NEW_API_PROVIDERS.get(provider)
+    if not cfg:
+        return None, f"未知的 NewAPI 提供商: {provider}", None
+    api_key = cfg["api_key"]
+    if not api_key:
+        return None, f"未配置 {provider} 的 API key，请在 .env 中设置", None
+
+    content, error, metadata = _call_openai_compatible(
+        url=f"{NEW_API_BASE_URL.rstrip('/')}/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        model=cfg["model"],
+        messages=messages,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        caller_label=f"{caller_label}|NewAPI/{provider}",
+    )
+    if metadata:
+        metadata["channel"] = "NewAPI"
+        metadata["provider"] = provider
+    return content, error, metadata
+
+
+# ----------------------------------------------------------
+# 🗂️ 优先级列表 — 按顺序尝试，前者失败则降级到后者
+# ----------------------------------------------------------
+# 每项: (名称, 调用函数)
+# 调整顺序即可改变优先级，新增渠道只需添加一行。
+# 如需指定不同的 NewAPI 提供商，用 lambda 传参：
+#   ("NewAPI/OpenAI", lambda m, **kw: _call_new_api(m, provider="OpenAI", **kw)),
+_AI_PROVIDER_CHAIN = [
+    ("NewAPI/Vertex_AI", _call_new_api),   # 默认 provider="Vertex_AI"
+    ("OpenClaw",         _call_openclaw),
+]
+
+
+# ----------------------------------------------------------
+# 🚀 入口方法 (对外接口不变)
+# ----------------------------------------------------------
+
 def call_ai_with_retry(
     messages: list[dict],
     *,
@@ -424,7 +681,9 @@ def call_ai_with_retry(
     caller_label: str = "AI",
 ) -> tuple[str | None, str | None, dict | None]:
     """
-    向 OpenClaw 发送 chat completion 请求，内置重试与限流排队。
+    AI 调用入口 — 按优先级依次尝试多个 channel，失败自动降级。
+
+    当前优先级: NewAPI/Vertex_AI → OpenClaw
 
     参数:
         messages     : OpenAI 兼容 messages 列表
@@ -434,115 +693,74 @@ def call_ai_with_retry(
 
     返回: (content, error_msg, metadata)
         成功时 content 为 AI 回复文本, error_msg 为 None
-        失败时 content 为 None, error_msg 为可读错误描述
-        metadata 为包含模型名称和 Token 用量的字典:
-            {"model": str, "prompt_tokens": int, "completion_tokens": int, "total_tokens": int}
-            失败时 metadata 为 None
+        失败时 content 为 None, error_msg 为所有通道的错误汇总
+        metadata 字段: channel(调用链路), provider(提供商), name(模型名),
+                       prompt_tokens, completion_tokens, total_tokens
         ⚠️ 若 AI 回复被截断 (finish_reason=length)，content 仍会返回（截断的内容），
-           同时 error_msg 会包含截断警告信息，调用方应检查 error_msg 以决定是否重试或告警。
-
-    重试策略 (第二层 — 仅在 OpenClaw 内部重试放弃后触发):
-        - 遇到 429 / 5xx 状态码时自动重试，最多 _MAX_RETRIES 次
-        - 指数退避 + 随机抖动：~60s → ~120s → ~240s（受 _MAX_BACKOFF_SEC 上限约束）
-        - 优先尊重服务端 Retry-After 头（如有）
-        - 使用全局 threading.Lock 串行化请求，防止并发请求互相挤占配额
+           同时 error_msg 会包含截断警告信息。
     """
-    import time as _time
+    errors: list[str] = []
 
     with _ai_call_lock:
-        last_error = ""
-        for attempt in range(_MAX_RETRIES + 1):  # 0 = 首次请求, 1..N = 重试
-            try:
-                res = requests.post(
-                    OPENCLAW_URL,
-                    headers=OPENCLAW_HEADERS,
-                    json={
-                        "model": "openclaw/default",
-                        "messages": messages,
-                        "max_tokens": max_tokens,
-                    },
-                    timeout=timeout,
-                )
+        for chain_name, chain_fn in _AI_PROVIDER_CHAIN:
+            print(f"🔄 [{caller_label}] 尝试通道: {chain_name}")
+            content, error, metadata = chain_fn(
+                messages,
+                max_tokens=max_tokens,
+                timeout=timeout,
+                caller_label=caller_label,
+            )
 
-                # ── 成功 ──
-                if res.status_code == 200:
-                    resp_body = res.json()
-                    content = resp_body["choices"][0]["message"]["content"]
-                    finish_reason = resp_body["choices"][0].get("finish_reason", "stop")
+            # 成功 或 截断（content 有值）→ 直接返回，不再降级
+            if content is not None:
+                return content, error, metadata
 
-                    # 提取模型名称和 Token 用量元数据
-                    usage = resp_body.get("usage", {})
-                    raw_model = resp_body.get("model", "unknown")
-                    # OpenClaw 网关回显请求时的 alias（如 "openclaw/default"），
-                    # 真实上游模型由 Agent 面板配置（含 fallback），此处如实记录。
-                    metadata = {
-                        "model": raw_model,
-                        "prompt_tokens": usage.get("prompt_tokens", 0),
-                        "completion_tokens": usage.get("completion_tokens", 0),
-                        "total_tokens": usage.get("total_tokens", 0),
-                    }
+            # 记录失败，继续降级
+            errors.append(f"[{chain_name}] {error}")
+            print(f"❌ [{caller_label}] 通道 {chain_name} 失败: {error}，尝试降级...")
 
-                    if finish_reason == "length":
-                        # AI 回复被截断：仍返回已有内容，但通过 error_msg 告警
-                        warn = (
-                            f"⚠️ [{caller_label}] AI 回复被截断 (finish_reason=length, "
-                            f"max_tokens={max_tokens})，输出不完整！"
-                        )
-                        print(warn)
-                        return content, warn, metadata
+    # 所有通道均失败
+    combined = "; ".join(errors)
+    return None, f"所有 AI 通道均失败: {combined}", None
 
-                    return content, None, metadata
 
-                # ── 提取 OpenClaw 返回的错误详情（用于日志诊断） ──
-                error_detail = ""
-                try:
-                    body = res.json()
-                    error_detail = body.get("error", {}).get("message", "") if isinstance(body, dict) else ""
-                except Exception:
-                    pass
+def call_new_api(
+    messages: list[dict],
+    *,
+    provider: str = "Vertex_AI",
+    max_tokens: int = 8192,
+    timeout: int = 360,
+    caller_label: str = "NewAPI",
+) -> tuple[str | None, str | None, dict | None]:
+    """
+    直接调用 VPS new-api 的独立入口（不走降级链）。
+    provider: 提供商名称，默认 Vertex_AI。
+    """
+    with _ai_call_lock:
+        return _call_new_api(
+            messages,
+            provider=provider,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            caller_label=caller_label,
+        )
 
-                # ── 可重试错误 ──
-                if res.status_code in _RETRYABLE_STATUS_CODES and attempt < _MAX_RETRIES:
-                    # 计算退避时间（指数退避 + 随机抖动）
-                    raw_backoff = min(_BASE_BACKOFF_SEC * (2 ** attempt), _MAX_BACKOFF_SEC)
 
-                    # 尊重 Retry-After 头（秒数格式）
-                    retry_after = res.headers.get("Retry-After")
-                    if retry_after:
-                        try:
-                            raw_backoff = max(raw_backoff, int(retry_after))
-                        except (ValueError, TypeError):
-                            pass
-
-                    backoff = _backoff_with_jitter(raw_backoff)
-                    last_error = f"HTTP {res.status_code}"
-                    detail_suffix = f" ({error_detail})" if error_detail else ""
-                    print(
-                        f"⚠️ [{caller_label}] 请求返回 {res.status_code}{detail_suffix}，"
-                        f"{backoff:.0f}秒后重试 ({attempt + 1}/{_MAX_RETRIES})..."
-                    )
-                    _time.sleep(backoff)
-                    continue
-
-                # ── 不可重试的非 200 ──
-                detail_suffix = f" ({error_detail})" if error_detail else ""
-                return None, f"HTTP {res.status_code}{detail_suffix}", None
-
-            except requests.exceptions.Timeout:
-                last_error = f"请求超时 ({timeout}s)"
-                if attempt < _MAX_RETRIES:
-                    backoff = _backoff_with_jitter(
-                        min(_BASE_BACKOFF_SEC * (2 ** attempt), _MAX_BACKOFF_SEC)
-                    )
-                    print(
-                        f"⚠️ [{caller_label}] 请求超时，"
-                        f"{backoff:.0f}秒后重试 ({attempt + 1}/{_MAX_RETRIES})..."
-                    )
-                    _time.sleep(backoff)
-                    continue
-
-            except Exception as e:
-                return None, f"异常: {e}", None
-
-        # 所有重试均耗尽
-        return None, f"重试{_MAX_RETRIES}次后仍失败 (最后错误: {last_error})", None
+def call_openclaw(
+    messages: list[dict],
+    *,
+    max_tokens: int = 8192,
+    timeout: int = 360,
+    caller_label: str = "OpenClaw",
+) -> tuple[str | None, str | None, dict | None]:
+    """
+    直接调用 OpenClaw 网关的独立入口（不走降级链）。
+    适用于明确只想使用 OpenClaw 的场景。
+    """
+    with _ai_call_lock:
+        return _call_openclaw(
+            messages,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            caller_label=caller_label,
+        )

@@ -27,6 +27,8 @@ from shared_utils import (
     fetch_option_snapshot,
     # AI 调用 (带重试 / 限流排队)
     call_ai_with_retry,
+    # AI 元数据格式化
+    format_ai_meta_footer,
 )
 
 # ==========================================
@@ -755,20 +757,10 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
         tg_parts.append("━━━━━━━━━━━━━━━━━━━━━")
     tg_parts.append(tg_reply)
 
-    # 附加 AI 元数据尾注（模型名称 + Token 用量）
-    meta_parts = []
-    if ai_model_name:
-        meta_parts.append(f"🤖 模型: {ai_model_name}")
-    if metadata:
-        meta_parts.append(
-            f"📊 Token: "
-            f"输入 {metadata.get('prompt_tokens', 0):,} + "
-            f"输出 {metadata.get('completion_tokens', 0):,} = "
-            f"合计 {metadata.get('total_tokens', 0):,}"
-        )
-    if meta_parts:
-        tg_parts.append("━━━━━━━━━━━━━━━━━━━━━")
-        tg_parts.append("\n".join(meta_parts))
+    # 附加 AI 元数据尾注
+    meta_footer = format_ai_meta_footer(ai_model_name, metadata)
+    if meta_footer:
+        tg_parts.append(meta_footer)
 
     tg_analysis("\n".join(tg_parts))
 
@@ -829,19 +821,7 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
         print(f"⚠️ 读取最终 PLAN_FILE 失败，降级推送原始 ai_reply: {e}")
 
     # 构建 AI 元数据尾注
-    meta_parts = []
-    if ai_model_name:
-        meta_parts.append(f"🤖 模型: {ai_model_name}")
-    if metadata:
-        meta_parts.append(
-            f"📊 Token: "
-            f"输入 {metadata.get('prompt_tokens', 0):,} + "
-            f"输出 {metadata.get('completion_tokens', 0):,} = "
-            f"合计 {metadata.get('total_tokens', 0):,}"
-        )
-    meta_footer = ""
-    if meta_parts:
-        meta_footer = "\n━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(meta_parts)
+    meta_footer = format_ai_meta_footer(ai_model_name, metadata)
 
     tg_analysis(
         f"📐 **网格重构完成** ┃ **{symbol}**\n"
