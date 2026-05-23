@@ -2,37 +2,44 @@
 # 安装: pip install -r requirements.txt
 #
 # 目录结构:
-#   longbridge/ - 长桥 SDK 封装核心服务
-#   futu/       - 富途 SDK 封装核心服务
-#   strategies/ - 量化交易策略 (盘前谋划 + 盘中哨兵)
-#   notion/     - Notion 账簿管理 (MCP 服务 + TG 指令机器人 + 价格同步器)
-#   prompts/    - AI 系统提示词
-#   data/       - 运行时数据 (交易计划 JSON + 缓存)
+#   longbridge/   - 长桥 SDK 封装 + FastMCP 服务
+#   futu/         - 富途 SDK 封装 + FastMCP 服务（期权专用）
+#   strategies/   - 量化交易策略核心 (shared_utils + 盘前谋划 + 盘中哨兵)
+#   notion/       - Notion 数字资管 (MCP 服务 + 数据库管理 + 价格同步器)
+#   telegram/     - Telegram 消息推送 + 交易指令 Bot
+#   stockscope/   - 独立行情快照采集器
+#   prompts/      - AI 系统提示词 (盘前/盘中裁决/网格重构)
+#   data/         - 运行时数据 (daily_trading_plan.json + cache/)
+#   random_password/ - 随机密码生成器
 
 # ──────────────────────────────────────────
-# 🔧 核心基础
+# 🔧 核心基础（全模块共用）
 # ──────────────────────────────────────────
-python-dotenv           # 读取 .env 环境变量
-pytz                    # 时区处理（港/美股交易时段判断）
-requests                # HTTP 请求（TG 推送、Tavily 新闻）
+python-dotenv           # 读取 .env 环境变量（全模块）
+pytz                    # 时区处理：港股 Asia/Hong_Kong、美股 America/New_York 交易时段判断
+requests                # HTTP 请求：TG 推送 (tg_sender)、Tavily REST API (shared_utils)、AI 网关调用 (shared_utils)
 
 # ──────────────────────────────────────────
-# 📈 长桥 SDK（core/ + strategies/）
+# 📈 券商 SDK（longbridge/ + futu/）
 # ──────────────────────────────────────────
-longbridge              # 长桥官方 Python SDK（行情 + 交易）
-futu-api                # 富途官方 Python SDK（期权行情）
-pandas                  # 数据处理（YahooQuery 期权降级通道需要）
-yahooquery              # 美股期权行情降级通道（长桥无权限时自动切换）
+longbridge              # 长桥官方 Python SDK（行情 + 交易 + 交易日历 + 市场温度）
+futu-api                # 富途官方 Python SDK（期权到期日 + 期权链 + 期权快照）
+yahooquery              # 美股期权行情降级通道（富途权限不足时自动切换）
+pandas                  # 数据处理（YahooQuery 期权数据解析依赖）
 
 # ──────────────────────────────────────────
-# 🤖 AI 服务集成（strategies/）
+# 🤖 AI 服务 + MCP 框架
 # ──────────────────────────────────────────
-schedule                # 定时任务（premarket_planner 定时触发）
+fastmcp                 # MCP 服务框架（longbridge_server / futu_options_server / notion_mcp_server）
 
 # ──────────────────────────────────────────
-# 🗃️ Notion 账簿（notion/）
+# ⏰ 定时任务调度
 # ──────────────────────────────────────────
-notion-client           # Notion 官方 Python SDK
-python-telegram-bot     # Telegram Bot SDK（tg_trade_bot 交易指令机器人）
-fastmcp                 # MCP 服务框架（notion_mcp_server）
-apscheduler             # 定时任务调度（notion_price_syncer 用，比 schedule 更强大）
+schedule                # 轻量级定时任务（premarket_planner 盘前调度：周一至周五 08:30/20:15）
+apscheduler             # 高级 cron 调度器（notion_price_syncer：每 5 分钟价格同步）
+
+# ──────────────────────────────────────────
+# 🗃️ Notion 账簿 + Telegram Bot
+# ──────────────────────────────────────────
+notion-client           # Notion 官方 Python SDK（流水记录 + 持仓同步 + 数据导出 + 价格同步）
+python-telegram-bot     # Telegram Bot SDK（tg_trade_bot：/buy /sell /export /fetch /passwd 命令）
