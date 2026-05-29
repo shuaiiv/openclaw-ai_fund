@@ -22,6 +22,21 @@ DB_TRANS_US = os.getenv("DB_TRANS_US")
 def record_transaction(market: str, action: str, name: str, code: str, date: str, amount: int, price: float, fee: float):
     ds_id = DB_TRANS_HK if market == "HK" else DB_TRANS_US
     try:
+        if action not in {"Buy", "Sell"}:
+            return {"status": "error", "msg": "❌ 未知的交易动作"}
+        if int(amount) <= 0:
+            return {"status": "error", "msg": "❌ 交易数量必须大于 0"}
+        if float(price) < 0 or float(fee) < 0:
+            return {"status": "error", "msg": "❌ 价格和手续费不能为负数"}
+
+        if action == "Sell":
+            current_count, _ = _rebuild_position_from_transactions(market, code)
+            if int(amount) > current_count:
+                return {
+                    "status": "error",
+                    "msg": f"❌ 卖出数量超过持仓：当前 {code} 只有 {current_count} 股，不能卖出 {amount} 股"
+                }
+
         # 1. 先写流水账
         logging.info(f"[流水] 开始写入: {market} {action} {code} x{amount} @{price}, fee={fee}")
         trans_resp = notion.pages.create(
@@ -54,9 +69,121 @@ def record_transaction(market: str, action: str, name: str, code: str, date: str
 # ==========================================
 # 肌肉功能 2：更新持仓数据
 # ==========================================
+def _prop_number(props: dict, name: str) -> float:
+    data = props.get(name, {})
+    if data.get("type") == "number":
+        return float(data.get("number") or 0)
+    if data.get("type") == "formula":
+        formula = data.get("formula", {})
+        if formula.get("type") == "number":
+            return float(formula.get("number") or 0)
+    return 0.0
+
+
+def _prop_select(props: dict, name: str) -> str:
+    data = props.get(name, {})
+    selected = data.get("select") if data.get("type") == "select" else None
+    return selected.get("name", "") if selected else ""
+
+
+def _prop_date(props: dict, name: str) -> str:
+    data = props.get(name, {})
+    value = data.get("date") if data.get("type") == "date" else None
+    return value.get("start", "") if value else ""
+
+
+def _query_transactions_for_code(market: str, code: str) -> list:
+    ds_id = DB_TRANS_HK if market == "HK" else DB_TRANS_US
+    results, has_more, cursor = [], True, None
+
+    while has_more:
+        resp = notion.data_sources.query(
+            data_source_id=ds_id,
+            filter={"property": "Stock Code", "rich_text": {"equals": code}},
+            **({"start_cursor": cursor} if cursor else {})
+        )
+        results.extend(resp.get("results", []))
+        has_more = resp.get("has_more", False)
+        cursor = resp.get("next_cursor")
+        if len(results) > 5000:
+            break
+
+    return results
+
+
+def _rebuild_position_from_transactions(market: str, code: str) -> tuple[int, float]:
+    """
+    Conservative cost model:
+    - Buy creates a lot with fee included in unit cost.
+    - Sell removes shares from the lowest-cost lots first.
+
+    The remaining lots therefore keep a deliberately higher cost basis, which
+    is useful as a risk-control / psychology cost instead of broker accounting.
+    """
+    rows = _query_transactions_for_code(market, code)
+    trades = []
+
+    for row in rows:
+        props = row.get("properties", {})
+        action = _prop_select(props, "Action")
+        trade_date = _prop_date(props, "Date")
+        count = int(_prop_number(props, "Count"))
+        price = _prop_number(props, "Price")
+        fee = _prop_number(props, "Trade Fee")
+
+        if action not in {"Buy", "Sell"} or count <= 0:
+            continue
+
+        trades.append({
+            "id": row.get("id", ""),
+            "created_time": row.get("created_time", ""),
+            "date": trade_date,
+            "action": action,
+            "count": count,
+            "price": price,
+            "fee": fee,
+        })
+
+    trades.sort(key=lambda x: (x["date"], x["created_time"], x["id"]))
+
+    lots = []
+    for trade in trades:
+        if trade["action"] == "Buy":
+            unit_cost = ((trade["count"] * trade["price"]) + trade["fee"]) / trade["count"]
+            lots.append({"count": trade["count"], "unit_cost": unit_cost})
+            continue
+
+        sell_count = trade["count"]
+        held_count = sum(lot["count"] for lot in lots)
+        if sell_count > held_count:
+            raise ValueError(
+                f"{code} 在 {trade['date']} 卖出 {sell_count} 股，但此前可用持仓只有 {held_count} 股"
+            )
+
+        lots.sort(key=lambda x: x["unit_cost"])
+        while sell_count > 0:
+            lot = lots[0]
+            used = min(sell_count, lot["count"])
+            lot["count"] -= used
+            sell_count -= used
+
+            if lot["count"] == 0:
+                lots.pop(0)
+
+    new_count = int(sum(lot["count"] for lot in lots))
+    total_cost = sum(lot["count"] * lot["unit_cost"] for lot in lots)
+    new_unit_price = total_cost / new_count if new_count > 0 else 0
+    return new_count, new_unit_price
+
+
 def update_position(market: str, name: str, code: str, action: str, amount: int, price: float, fee: float):
     ds_id = DB_POS_HK if market == "HK" else DB_POS_US
     try:
+        if action not in {"Buy", "Sell"}:
+            return {"status": "error", "msg": "未知的交易动作"}
+
+        new_count, new_unit_price = _rebuild_position_from_transactions(market, code)
+
         # 🎯 直接拿你的 ID 去查
         query = notion.data_sources.query(
             data_source_id=ds_id,
@@ -65,20 +192,6 @@ def update_position(market: str, name: str, code: str, action: str, amount: int,
         
         if query['results']:
             page_id = query['results'][0]['id']
-            props = query['results'][0]['properties']
-            old_count = props['Count'].get('number', 0)
-            old_unit_price = props['Unit Price'].get('number', 0)
-            
-            if action == "Buy":
-                new_count = old_count + amount
-                total_cost = (old_count * old_unit_price) + (amount * price) + fee
-                new_unit_price = total_cost / new_count if new_count > 0 else 0
-            elif action == "Sell":
-                new_count = old_count - amount
-                new_unit_price = old_unit_price 
-            else:
-                return {"status": "error", "msg": "未知的交易动作"}
-
             notion.pages.update(
                 page_id=page_id,
                 properties={
@@ -86,22 +199,21 @@ def update_position(market: str, name: str, code: str, action: str, amount: int,
                     "Unit Price": {"number": round(new_unit_price, 4)}
                 }
             )
-            return {"status": "success", "msg": f"已更新持仓: {code} 数量 {new_count}, 均价 {new_unit_price:.2f}"}
+            return {"status": "success", "msg": f"已更新持仓: {code} 数量 {new_count}, 保守成本 {new_unit_price:.2f}"}
         else:
-            if action == "Sell":
-                 return {"status": "error", "msg": "没有持仓无法卖出！"}
-            new_unit_price = ((amount * price) + fee) / amount
+            if action == "Sell" or new_count <= 0:
+                return {"status": "error", "msg": "没有持仓无法卖出！"}
             logging.info(f"[持仓] 新建仓位: {code}")
             notion.pages.create(
                 parent={"type": "data_source_id", "data_source_id": ds_id},
                 properties={
                     "Stock Name": {"title": [{"text": {"content": name}}]},
                     "Stock Code": {"rich_text": [{"text": {"content": code}}]},
-                    "Count": {"number": amount},
+                    "Count": {"number": new_count},
                     "Unit Price": {"number": round(new_unit_price, 4)}
                 }
             )
-            return {"status": "success", "msg": f"已新建仓位: {code} 数量 {amount}, 均价 {new_unit_price:.2f}"}
+            return {"status": "success", "msg": f"已新建仓位: {code} 数量 {new_count}, 保守成本 {new_unit_price:.2f}"}
     except Exception as e:
         logging.error(f"[持仓] 更新失败: {str(e)}")
         return {"status": "error", "msg": str(e)}
