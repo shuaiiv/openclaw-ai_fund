@@ -92,6 +92,11 @@ def _prop_date(props: dict, name: str) -> str:
     return value.get("start", "") if value else ""
 
 
+def _prop_created_time(props: dict, name: str) -> str:
+    data = props.get(name, {})
+    return data.get("created_time", "") if data.get("type") == "created_time" else ""
+
+
 def _query_transactions_for_code(market: str, code: str) -> list:
     ds_id = DB_TRANS_HK if market == "HK" else DB_TRANS_US
     results, has_more, cursor = [], True, None
@@ -127,6 +132,7 @@ def _rebuild_position_from_transactions(market: str, code: str) -> tuple[int, fl
         props = row.get("properties", {})
         action = _prop_select(props, "Action")
         trade_date = _prop_date(props, "Date")
+        created_time = _prop_created_time(props, "Created time") or row.get("created_time", "")
         count = int(_prop_number(props, "Count"))
         price = _prop_number(props, "Price")
         fee = _prop_number(props, "Trade Fee")
@@ -135,43 +141,43 @@ def _rebuild_position_from_transactions(market: str, code: str) -> tuple[int, fl
             continue
 
         trades.append({
-            "id": row.get("id", ""),
-            "created_time": row.get("created_time", ""),
-            "date": trade_date,
-            "action": action,
-            "count": count,
-            "price": price,
-            "fee": fee,
+            "Notion Page ID": row.get("id", ""),
+            "Created time": created_time,
+            "Date": trade_date,
+            "Action": action,
+            "Count": count,
+            "Price": price,
+            "Trade Fee": fee,
         })
 
-    trades.sort(key=lambda x: (x["date"], x["created_time"], x["id"]))
+    trades.sort(key=lambda x: (x["Date"], x["Created time"], x["Notion Page ID"]))
 
     lots = []
     for trade in trades:
-        if trade["action"] == "Buy":
-            unit_cost = ((trade["count"] * trade["price"]) + trade["fee"]) / trade["count"]
-            lots.append({"count": trade["count"], "unit_cost": unit_cost})
+        if trade["Action"] == "Buy":
+            unit_cost = ((trade["Count"] * trade["Price"]) + trade["Trade Fee"]) / trade["Count"]
+            lots.append({"Count": trade["Count"], "Unit Price": unit_cost})
             continue
 
-        sell_count = trade["count"]
-        held_count = sum(lot["count"] for lot in lots)
+        sell_count = trade["Count"]
+        held_count = sum(lot["Count"] for lot in lots)
         if sell_count > held_count:
             raise ValueError(
-                f"{code} 在 {trade['date']} 卖出 {sell_count} 股，但此前可用持仓只有 {held_count} 股"
+                f"{code} 在 {trade['Date']} 卖出 {sell_count} 股，但此前可用持仓只有 {held_count} 股"
             )
 
-        lots.sort(key=lambda x: x["unit_cost"])
+        lots.sort(key=lambda x: x["Unit Price"])
         while sell_count > 0:
             lot = lots[0]
-            used = min(sell_count, lot["count"])
-            lot["count"] -= used
+            used = min(sell_count, lot["Count"])
+            lot["Count"] -= used
             sell_count -= used
 
-            if lot["count"] == 0:
+            if lot["Count"] == 0:
                 lots.pop(0)
 
-    new_count = int(sum(lot["count"] for lot in lots))
-    total_cost = sum(lot["count"] * lot["unit_cost"] for lot in lots)
+    new_count = int(sum(lot["Count"] for lot in lots))
+    total_cost = sum(lot["Count"] * lot["Unit Price"] for lot in lots)
     new_unit_price = total_cost / new_count if new_count > 0 else 0
     return new_count, new_unit_price
 
