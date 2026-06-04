@@ -135,12 +135,61 @@ def parse_code(raw: str) -> tuple[str, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def parse_platform(raw: str) -> str:
+    """解析港股平台名称。"""
+    normalized = raw.strip().lower()
+    if normalized == "futu":
+        return "Futu"
+    if normalized == "trade25":
+        return "Trade25"
+    raise ValueError(f"无法识别的平台: {raw!r}，目前支持 Futu / Trade25")
+
+
+def parse_trade_extras(market: str, extras: list[str]) -> tuple[str | None, str, str]:
+    """
+    解析 /buy /sell 中手续费后的可选参数。
+
+    支持：
+      [日期]
+      [平台]
+      [日期] [平台]
+      [平台] [日期]
+    """
+    trade_date = date.today().strftime('%Y-%m-%d')
+    date_note = "（默认今日）"
+    date_seen = False
+    platform = None
+
+    for raw in extras:
+        if raw.strip().lower() in {"futu", "trade25"}:
+            parsed_platform = parse_platform(raw)
+            if market != "HK":
+                continue
+            if platform is not None:
+                raise ValueError("平台参数重复")
+            platform = parsed_platform
+            continue
+
+        try:
+            if date_seen:
+                raise ValueError("日期参数重复")
+            trade_date = parse_date(raw)
+            date_note = ""
+            date_seen = True
+        except ValueError as date_error:
+            raise ValueError(
+                f"无法识别可选参数: {raw!r}。请填写日期，或港股平台 Futu / Trade25"
+            ) from date_error
+
+    return platform, trade_date, date_note
+
+
 # 1. 核心交易处理逻辑 (处理 Buy 和 Sell)
 async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side: str):
     """
     参数结构（市场从代码中自动识别，日期可省略）：
-      /buy  名字 代码 数量 价格 手续费 [日期]
-      /sell 名字 代码 数量 价格 手续费 [日期]
+      /buy  名字 代码 数量 价格 手续费 [日期] [平台]
+      /sell 名字 代码 数量 价格 手续费 [日期] [平台]
 
     代码格式：[Market].[Symbol]，例如 HK.03690 或 US.AAPL
 
@@ -152,15 +201,19 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
       /buy 美团 HK.03690 100 76.8 60 0312          ← MMDD → 当年
       /buy 美团 HK.03690 100 76.8 60 03/12         ← MM/DD → 当年
       /buy 美团 HK.03690 100 76.8 60 12            ← DD → 当年当月
+      /buy 美团 HK.03690 100 76.8 60 Futu          ← 港股指定平台
+      /buy 美团 HK.03690 100 76.8 60 0312 Trade25  ← 日期 + 港股平台
       /buy 苹果 US.AAPL 10 210.5 5
     """
     try:
-        # 参数数量：5个（不含日期）或 6个（含日期）
+        # 参数数量：5个（不含可选项）或 7个以内（日期 / 港股平台）
         if len(context.args) < 5:
             raise ValueError("参数数量不足，至少需要 5 个参数")
+        if len(context.args) > 7:
+            raise ValueError("参数过多，手续费后最多填写日期和港股平台")
 
         name, raw_code, amount, price, fee = context.args[:5]
-        raw_date = context.args[5] if len(context.args) >= 6 else None
+        extras = context.args[5:]
 
         # 1.1 从代码中自动识别市场
         try:
@@ -174,24 +227,19 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
             )
             return
 
-        # 1.2 日期解析（省略时使用今天）
-        if raw_date is None:
-            trade_date = date.today().strftime('%Y-%m-%d')
-            date_note = "（默认今日）"
-        else:
-            try:
-                trade_date = parse_date(raw_date)
-                date_note = ""
-            except ValueError as e:
-                await update.message.reply_text(
-                    f"❌ 日期格式错误: {e}\n\n"
-                    "💡 支持的日期格式:\n"
-                    "  完整: YYYY-MM-DD / YYYY/MM/DD / YYYYMMDD / MM/DD/YYYY\n"
-                    "  省略年份: MMDD / MM-DD / MM/DD（自动补全当年）\n"
-                    "  仅输入日: DD（自动补全当年当月）\n"
-                    "  省略日期: 不填则默认今天"
-                )
-                return
+        # 1.2 日期和港股平台解析（省略日期时使用今天；港股平台默认由 DEFAULT_HK_PLATFORM 控制）
+        try:
+            platform, trade_date, date_note = parse_trade_extras(market, extras)
+        except ValueError as e:
+            await update.message.reply_text(
+                f"❌ 可选参数错误: {e}\n\n"
+                "💡 支持的日期格式:\n"
+                "  完整: YYYY-MM-DD / YYYY/MM/DD / YYYYMMDD / MM/DD/YYYY\n"
+                "  省略年份: MMDD / MM-DD / MM/DD（自动补全当年）\n"
+                "  仅输入日: DD（自动补全当年当月）\n"
+                "  港股平台: Futu / Trade25"
+            )
+            return
 
         # 1.3 调用逻辑层写入 Notion
         # 注意：notion_db_manager 内部应处理 side="Sell" 时数量转负数的逻辑
@@ -203,15 +251,18 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
             date=trade_date,
             amount=int(amount),
             price=float(price),
-            fee=float(fee)
+            fee=float(fee),
+            platform=platform
         )
 
         icon = "🟢" if side == "Buy" else "🔴"
         status_text = "买入" if side == "Buy" else "卖出"
+        platform_text = f"\n🏦 交易平台: {platform or os.getenv('DEFAULT_HK_PLATFORM', 'Trade25')}" if market == "HK" else ""
 
         await update.message.reply_text(
             f"{icon} 识别为 [{market}] 市场 {status_text}\n"
             f"📅 交易日期: {trade_date} {date_note}\n"
+            f"{platform_text}\n"
             f"--------------------------\n"
             f"{res['msg']}"
         )
@@ -221,15 +272,17 @@ async def handle_trade(update: Update, context: ContextTypes.DEFAULT_TYPE, side:
         await update.message.reply_text(
             f"❌ 录入失败!\n原因: {str(e)}\n\n"
             f"💡 正确格式:\n"
-            f"/{side.lower()} 名字 代码 数量 价格 手续费 [日期]\n\n"
+            f"/{side.lower()} 名字 代码 数量 价格 手续费 [日期] [平台]\n\n"
             f"代码格式: [市场].[代码]，例如 HK.03690 或 US.AAPL\n\n"
             f"日期可省略（默认今天），支持多种格式:\n"
             f"  YYYY-MM-DD / YYYY/MM/DD / YYYYMMDD / MM/DD/YYYY\n"
             f"  MMDD / MM-DD / MM/DD（自动补全当年）\n"
             f"  DD（自动补全当年当月）\n\n"
+            f"港股平台可选: Futu / Trade25\n\n"
             f"示例:\n"
             f"  /{side.lower()} 美团 HK.03690 100 76.8 60\n"
             f"  /{side.lower()} 美团 HK.03690 100 76.8 60 20260312\n"
+            f"  /{side.lower()} 美团 HK.03690 100 76.8 60 0312 Trade25\n"
             f"  /{side.lower()} 苹果 US.AAPL 10 210.5 5 0312"
         )
 
@@ -348,7 +401,45 @@ async def buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await handle_trade(update, context, "Sell")
 
-# 5. 密码生成逻辑
+# 5. 已实现盈亏同步
+@restricted
+async def realized_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        market = None
+        if context.args:
+            raw_market = context.args[0].upper()
+            if raw_market in ["HK", "港股"]:
+                market = "HK"
+            elif raw_market in ["US", "美股"]:
+                market = "US"
+            elif raw_market in ["ALL", "全部"]:
+                market = None
+            else:
+                await update.message.reply_text("❌ 市场错误，请使用: HK / US / all")
+                return
+
+        scope = market or "HK + US"
+        await update.message.reply_text(f"⏳ 正在同步 {scope} 已实现盈亏...")
+
+        res = notion_database_manager.sync_realized_pnl(market=market)
+        if res["status"] in {"success", "warning"}:
+            icon = "✅" if res["status"] == "success" else "⚠️"
+            await update.message.reply_text(f"{icon} Realized P&L 同步完成\n{res['msg']}")
+        else:
+            await update.message.reply_text(f"❌ Realized P&L 同步失败: {res['msg']}")
+
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ 指令错误: {str(e)}\n\n"
+            "💡 用法:\n"
+            "/realized_pnl [HK|US|all]\n\n"
+            "示例:\n"
+            "/realized_pnl\n"
+            "/realized_pnl HK"
+        )
+
+
+# 6. 密码生成逻辑
 @restricted
 async def passwd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -422,10 +513,11 @@ def main():
     app.add_handler(CommandHandler("sell", sell))
     app.add_handler(CommandHandler("export", export))
     app.add_handler(CommandHandler("fetch", fetch))
+    app.add_handler(CommandHandler("realized_pnl", realized_pnl))
     app.add_handler(CommandHandler("passwd", passwd))
 
     print("🚀 Command Bot 正在运行...")
-    print("✅ 已载入命令: /buy, /sell, /export, /fetch, /passwd")
+    print("✅ 已载入命令: /buy, /sell, /export, /fetch, /realized_pnl, /passwd")
 
     app.run_polling()
 
