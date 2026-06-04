@@ -11,6 +11,7 @@ Notion 持仓价格同步器 (Notion Price Syncer)
 
 依赖环境变量: NOTION_TOKEN, DB_POS_HK, DB_POS_US,
               LONGBRIDGE_APP_KEY, LONGBRIDGE_APP_SECRET, LONGBRIDGE_ACCESS_TOKEN
+可选环境变量: UPDATE_ONLY_POSITIVE_COUNT=true/false, POSITION_COUNT_PROPERTY=Count
 
 架构说明:
   长桥 API 调用全部通过 longbridge/longbridge_server.py 中的封装函数完成，
@@ -53,6 +54,10 @@ warnings.filterwarnings("ignore", module="tzlocal")
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DB_POS_HK    = os.getenv("DB_POS_HK")
 DB_POS_US    = os.getenv("DB_POS_US")
+POSITION_COUNT_PROPERTY = os.getenv("POSITION_COUNT_PROPERTY", "Count")
+UPDATE_ONLY_POSITIVE_COUNT = os.getenv("UPDATE_ONLY_POSITIVE_COUNT", "true").strip().lower() not in {
+    "0", "false", "no", "off"
+}
 
 notion = Client(auth=NOTION_TOKEN)
 
@@ -72,6 +77,50 @@ def get_lb_code(raw_code: str, market: str) -> str:
     else:
         lb_code = raw_code.replace("US.", "")
         return lb_code if lb_code.endswith(".US") else f"{lb_code}.US"
+
+
+def _plain_text_property(row: dict, prop_name: str) -> str:
+    """读取 Notion title/rich_text 属性的纯文本。"""
+    prop = row.get("properties", {}).get(prop_name, {})
+    prop_type = prop.get("type")
+    if prop_type not in {"title", "rich_text"}:
+        return ""
+    return "".join(part.get("plain_text", "") for part in prop.get(prop_type, [])).strip()
+
+
+def _number_property(row: dict, prop_name: str):
+    """读取 Notion number 属性；兼容返回 number 的 formula。"""
+    prop = row.get("properties", {}).get(prop_name, {})
+    prop_type = prop.get("type")
+    if prop_type == "number":
+        return prop.get("number")
+    if prop_type == "formula":
+        formula = prop.get("formula", {})
+        if formula.get("type") == "number":
+            return formula.get("number")
+    return None
+
+
+def _should_update_price(row: dict) -> bool:
+    """只允许持仓数量大于 0 的行更新价格。"""
+    if not UPDATE_ONLY_POSITIVE_COUNT:
+        return True
+
+    count = _number_property(row, POSITION_COUNT_PROPERTY)
+    raw_code = _plain_text_property(row, "Stock Code") or row.get("id", "unknown")
+    if count is None:
+        print(f"⚠️ {raw_code} 缺少 {POSITION_COUNT_PROPERTY} 持仓数量，跳过价格更新")
+        return False
+
+    try:
+        if float(count) > 0:
+            return True
+    except (TypeError, ValueError):
+        print(f"⚠️ {raw_code} 的 {POSITION_COUNT_PROPERTY}={count} 无法识别，跳过价格更新")
+        return False
+
+    print(f"⏭️ {raw_code} 持仓数量 {count} <= 0，跳过价格更新")
+    return False
 
 
 def _query_all_positions(ds_id: str) -> list:
@@ -111,8 +160,14 @@ def update_t1_price(market: str, ds_id: str):
         rows = _query_all_positions(ds_id)
 
         for row in rows:
+            if not _should_update_price(row):
+                continue
+
             page_id  = row["id"]
-            raw_code = row["properties"]["Stock Code"]["rich_text"][0]["plain_text"]
+            raw_code = _plain_text_property(row, "Stock Code")
+            if not raw_code:
+                print(f"⚠️ {page_id} 缺少 Stock Code，跳过")
+                continue
             lb_code  = get_lb_code(raw_code, market)
 
             try:
@@ -158,8 +213,14 @@ def update_current_price(market: str, ds_id: str):
         rows = _query_all_positions(ds_id)
 
         for row in rows:
+            if not _should_update_price(row):
+                continue
+
             page_id  = row["id"]
-            raw_code = row["properties"]["Stock Code"]["rich_text"][0]["plain_text"]
+            raw_code = _plain_text_property(row, "Stock Code")
+            if not raw_code:
+                print(f"⚠️ {page_id} 缺少 Stock Code，跳过")
+                continue
             lb_code  = get_lb_code(raw_code, market)
 
             try:
