@@ -134,11 +134,14 @@
 - **`notion_database_manager.py`** (202 行): 核心记录引擎。
   - `record_transaction`: 向 Notion 流水表（`DB_TRANS_HK` / `DB_TRANS_US`）写入交易记录，成功后自动触发 `update_position` 同步持仓。
   - `update_position`: 更新 Notion 持仓表（`DB_POS_HK` / `DB_POS_US`），买入时按加权平均计算新成本价（含手续费），卖出时保持原成本价。空仓卖出拦截。首次建仓自动新建持仓行。
+  - `sync_daily_pnl_snapshot`: 向每日盈亏表（港股合并表 `DB_DAILY_PNL_HK`，美股表 `DB_DAILY_PNL_US`）写入每日快照；港股通过 `Platform` 区分 Trade25/Futu。
   - `export_data_to_file`: 翻页安全的全量 CSV 导出（上限 5000 条），自动解析 Notion 所有属性类型（title/rich_text/number/select/date/formula），保存至脚本同级 `exported_data/` 目录。
 
-- **`notion_price_syncer.py`** (273 行): 后台定时同步精灵（基于 APScheduler `BlockingScheduler`）。
-  - **T-1 收盘价**: 港股 08:30（次日开盘前）/ 美股 16:05（当日收盘后），使用 `_logic_get_live_quote` 的 `last_done` 字段。
-  - **实时价格**: 港股 09:30-16:10 每 5 分钟 / 美股 04:00-20:00 每 5 分钟（含盘前/盘后延伸时段），港股用 `_logic_get_live_quote`，美股用 `_logic_get_extended_quote`（自动选时段最新价）。
+- **`notion_price_syncer.py`**: 后台定时同步精灵（基于 APScheduler `BlockingScheduler`），负责日常最新价格和每日盈亏快照，不需要额外日常 PnL 脚本。
+  - **交易日判断**: 每个任务入口先通过长桥交易日历确认对应市场今天是否交易，假期自动跳过。
+  - **T-1 收盘价**: 港股 08:30（开盘前）使用历史日 K 最新 close；美股 16:00 ET 盘后开始时先把 T-1 基准切到当日常规盘收盘价，20:05 ET 再用官方日 K close 修正，和每日盈亏快照保持同一收盘口径。
+  - **实时价格**: 港股 09:25 建立/刷新当日快照，09:30-16:10 每 5 分钟刷新；美股 04:00-15:55 ET 每 5 分钟刷新当日快照，16:00-20:00 ET 盘后价格归入下一美股交易日快照。港股用 `_logic_get_live_quote`，美股用 `_logic_get_extended_quote`（自动选时段最新价）。
+  - **每日盈亏快照**: 每轮价格更新结束后刷新当日快照，写入日度 PnL、累计 PnL、持仓市值、成本基准等字段；港股写入合并表并按 `Platform` 区分 Trade25/Futu，美股写入独立表。
   - **架构**: 不直接依赖 longbridge SDK，所有 API 调用通过 `longbridge_server.py` 封装函数完成。
 
 - **`notion_mcp_server.py`** (43 行): Notion 集成的 MCP（Model Context Protocol）服务框架入口。
@@ -221,6 +224,7 @@ AI 模型做决定的"大纲"和"性格设计"。
 | `NOTION_TOKEN` | Notion API Token | `notion/` 全部模块 |
 | `DB_POS_HK` / `DB_POS_US` | Notion 持仓表 Data Source ID | `notion_database_manager.py`, `notion_price_syncer.py` |
 | `DB_TRANS_HK` / `DB_TRANS_US` | Notion 流水表 Data Source ID | `notion_database_manager.py` |
+| `DB_DAILY_PNL_HK` / `DB_DAILY_PNL_US` | Notion 每日盈亏表 Data Source ID；港股表通过 `Platform` 区分 Trade25/Futu | `notion_database_manager.py`, `notion_price_syncer.py`, `pnl_dashboard.py` |
 | `TG_BOT_TOKEN_CLAW` | TG Bot Token (策略频道) | `premarket_planner.py`, `intraday_sentry.py` |
 | `TG_BOT_TOKEN_QUANT` | TG Bot Token (交易频道) | `longbridge_server.py`, `intraday_sentry.py`, `tg_trade_bot.py` |
 | `TG_CHANNEL_ID_ANALYSIS` | TG Analysis 频道 ID | `premarket_planner.py`, `intraday_sentry.py` |
@@ -242,7 +246,8 @@ pip install -r requirements.txt
 # 后台常驻服务（建议使用 systemd 或 pm2）
 python strategies/premarket_planner.py    # 盘前谋划调度器
 python strategies/intraday_sentry.py      # 日内哨兵主循环
-python notion/notion_price_syncer.py      # Notion 价格同步器
+python notion/notion_price_syncer.py      # Notion 价格 + 每日盈亏快照同步器
+python notion/pnl_dashboard.py            # 每日盈亏 Web 看板
 python telegram/tg_trade_bot.py           # Telegram 交易指令 Bot
 
 # MCP 服务（供 OpenClaw Gateway 调用）

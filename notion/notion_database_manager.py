@@ -16,13 +16,31 @@ DB_POS_HK = os.getenv("DB_POS_HK")
 DB_TRANS_HK = os.getenv("DB_TRANS_HK")
 DB_POS_US = os.getenv("DB_POS_US")
 DB_TRANS_US = os.getenv("DB_TRANS_US")
+DB_DAILY_PNL_HK = os.getenv("DB_DAILY_PNL_HK")
+DB_DAILY_PNL_US = os.getenv("DB_DAILY_PNL_US")
 
 DEFAULT_HK_PLATFORM = os.getenv("DEFAULT_HK_PLATFORM", "Trade25")
 REALIZED_PNL_PROPERTY = "Realized P&L"
+DAILY_PNL_TITLE_PROPERTY = os.getenv("DAILY_PNL_TITLE_PROPERTY", "Name")
+DAILY_PNL_DATE_PROPERTY = os.getenv("DAILY_PNL_DATE_PROPERTY", "Date")
+DAILY_PNL_MARKET_PROPERTY = os.getenv("DAILY_PNL_MARKET_PROPERTY", "Market")
+DAILY_PNL_PLATFORM_PROPERTY = os.getenv("DAILY_PNL_PLATFORM_PROPERTY", "Platform")
 SKIP_REALIZED_PNL_KEYS = {
     ("HK", "Futu", "HK.0700"),
     ("HK", "Futu", "HK.00700"),
     ("HK", "Futu", "HK.03690"),
+}
+EXCLUDE_DAILY_PNL_KEYS = {
+    ("HK", "Futu", "HK.0700"),
+}
+MANUAL_COST_DAILY_PNL_KEYS = {
+    ("HK", "Futu", "HK.00700"),
+}
+EXCLUDE_DAILY_PNL_TRADES = {
+    ("HK", "Futu", "HK.03690", "2023-07-31", "Sell"),
+    ("HK", "Futu", "HK.00700", "2025-02-07", "Sell"),
+    ("HK", "Futu", "HK.00700", "2025-02-13", "Sell"),
+    ("HK", "Futu", "HK.00700", "2025-07-23", "Sell"),
 }
 
 # ==========================================
@@ -46,6 +64,25 @@ def _group_key(market: str, code: str, platform: str = "") -> tuple[str, str, st
 
 def _is_skipped_realized_pnl_key(market: str, code: str, platform: str = "") -> bool:
     return _group_key(market, code, platform) in SKIP_REALIZED_PNL_KEYS
+
+
+def _is_excluded_daily_pnl_key(market: str, code: str, platform: str = "") -> bool:
+    return _group_key(market, code, platform) in EXCLUDE_DAILY_PNL_KEYS
+
+
+def _is_manual_daily_pnl_cost_key(market: str, code: str, platform: str = "") -> bool:
+    return _group_key(market, code, platform) in MANUAL_COST_DAILY_PNL_KEYS
+
+
+def _is_excluded_daily_pnl_trade(market: str, trade: dict) -> bool:
+    key = (
+        market,
+        _normalize_platform(market, trade.get("Platform")) if market == "HK" else "",
+        trade.get("Stock Code", ""),
+        _date_key(trade.get("Date", "")),
+        trade.get("Action", ""),
+    )
+    return key in EXCLUDE_DAILY_PNL_TRADES
 
 
 def record_transaction(
@@ -100,23 +137,27 @@ def record_transaction(
 
         if is_futu_zero_allotment:
             pnl_result = sync_realized_pnl(market, code=code, platform=platform)
+            daily_pnl_result = sync_daily_pnl_snapshot(market=market, snapshot_date=date, platform=platform)
             pnl_msg = pnl_result.get("msg", "")
-            if pnl_result["status"] in {"success", "warning"}:
-                return {"status": "success", "msg": f"✅ 打新未中流水记录成功，已计入已实现盈亏！({pnl_msg})"}
-            return {"status": "warning", "msg": f"⚠️ 打新未中流水已记录，但已实现盈亏同步失败: {pnl_msg}"}
+            daily_pnl_msg = daily_pnl_result.get("msg", "")
+            if pnl_result["status"] in {"success", "warning"} and daily_pnl_result["status"] in {"success", "warning"}:
+                return {"status": "success", "msg": f"✅ 打新未中流水记录成功，已计入已实现盈亏和每日盈亏！({pnl_msg}；{daily_pnl_msg})"}
+            return {"status": "warning", "msg": f"⚠️ 打新未中流水已记录，但盈亏同步失败: Realized={pnl_msg}; Daily={daily_pnl_msg}"}
         
         # 2. 🚀 流水写入成功后，自动触发持仓更新逻辑！
         pos_result = update_position(market, name, code, action, amount, price, fee, platform)
         pnl_result = sync_realized_pnl(market, code=code, platform=platform)
+        daily_pnl_result = sync_daily_pnl_snapshot(market=market, snapshot_date=date, platform=platform)
         
         # 3. 将两者的结果打包返回给大模型
         if pos_result["status"] != "success":
             return {"status": "warning", "msg": f"⚠️ 流水记录成功，但持仓同步失败: {pos_result['msg']}"}
 
         pnl_msg = pnl_result.get("msg", "")
-        if pnl_result["status"] == "success":
-            return {"status": "success", "msg": f"✅ 流水记录成功，且已同步持仓与已实现盈亏！({pos_result['msg']}；{pnl_msg})"}
-        return {"status": "warning", "msg": f"⚠️ 流水和持仓已同步，但已实现盈亏同步失败: {pnl_msg}"}
+        daily_pnl_msg = daily_pnl_result.get("msg", "")
+        if pnl_result["status"] == "success" and daily_pnl_result["status"] == "success":
+            return {"status": "success", "msg": f"✅ 流水记录成功，且已同步持仓、已实现盈亏与每日盈亏！({pos_result['msg']}；{pnl_msg}；{daily_pnl_msg})"}
+        return {"status": "warning", "msg": f"⚠️ 流水和持仓已同步，但部分盈亏同步未完全成功: Realized={pnl_msg}; Daily={daily_pnl_msg}"}
             
     except Exception as e:
         logging.error(f"[流水] 写入失败: {str(e)}")
@@ -159,6 +200,11 @@ def _prop_date(props: dict, name: str) -> str:
 def _prop_created_time(props: dict, name: str) -> str:
     data = props.get(name, {})
     return data.get("created_time", "") if data.get("type") == "created_time" else ""
+
+
+def _date_key(raw_date: str) -> str:
+    """Return YYYY-MM-DD from a Notion date/datetime string."""
+    return (raw_date or "")[:10]
 
 
 def _query_all_rows(ds_id: str, limit: int = 5000) -> list:
@@ -464,6 +510,421 @@ def sync_realized_pnl(market: str | None = None, code: str | None = None, platfo
         return {"status": status, "msg": msg, "updated": updated, "created": created, "skipped": skipped, "errors": errors}
     except Exception as e:
         logging.error(f"[Realized P&L] 同步失败: {str(e)}")
+        return {"status": "error", "msg": str(e)}
+
+
+# ==========================================
+# 肌肉功能 3：每日盈亏快照
+# ==========================================
+def _daily_pnl_ds_id(market: str, platform: str | None = None) -> str | None:
+    if market == "HK":
+        return DB_DAILY_PNL_HK
+    if market == "US":
+        return DB_DAILY_PNL_US
+    raise ValueError(f"未知市场: {market!r}")
+
+
+def _daily_pnl_platform_label(market: str, platform: str | None = None) -> str:
+    if market == "HK":
+        return _normalize_platform(market, platform)
+    if market == "US":
+        return "IBKR"
+    raise ValueError(f"未知市场: {market!r}")
+
+
+def _today_for_market(market: str) -> str:
+    tz_name = "Asia/Hong_Kong" if market == "HK" else "America/New_York"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.datetime.now(ZoneInfo(tz_name)).date().isoformat()
+    except Exception:
+        return datetime.date.today().isoformat()
+
+
+def _snapshot_time_for_market(market: str) -> str:
+    tz_name = "Asia/Hong_Kong" if market == "HK" else "America/New_York"
+    try:
+        from zoneinfo import ZoneInfo
+
+        return datetime.datetime.now(ZoneInfo(tz_name)).isoformat()
+    except Exception:
+        return datetime.datetime.now().isoformat()
+
+
+def _safe_pct(numerator: float, denominator: float) -> float:
+    return numerator / denominator if denominator else 0.0
+
+
+def _daily_pnl_platforms(market: str, platform: str | None = None) -> list[str | None]:
+    if market == "HK":
+        return [_normalize_platform(market, platform)] if platform else ["Trade25", "Futu"]
+    return [None]
+
+
+def _calculate_realized_pnl_for_date(market: str, snapshot_date: str, platform: str | None = None) -> tuple[float, int, list[str]]:
+    """
+    Calculate realized P&L generated by trades whose Date equals snapshot_date.
+
+    The lot engine matches the existing conservative model: sells consume the
+    lowest-cost lots first, and buy fees are included in unit cost.
+    """
+    trans_ds_id = DB_TRANS_HK if market == "HK" else DB_TRANS_US
+    platform_filter = _normalize_platform(market, platform) if market == "HK" else ""
+    grouped_trades = defaultdict(list)
+    errors = []
+
+    for row in _query_all_rows(trans_ds_id):
+        trade = _trade_from_row(market, row)
+        if not trade:
+            continue
+        if _is_excluded_daily_pnl_trade(market, trade):
+            continue
+        if _date_key(trade["Date"]) > snapshot_date:
+            continue
+        if market == "HK" and trade["Platform"] != platform_filter:
+            continue
+        key = _group_key(market, trade["Stock Code"], trade["Platform"])
+        if _is_excluded_daily_pnl_key(market, trade["Stock Code"], trade["Platform"]):
+            continue
+        if _is_manual_daily_pnl_cost_key(market, trade["Stock Code"], trade["Platform"]):
+            continue
+        grouped_trades[key].append(trade)
+
+    realized_pnl = 0.0
+    realized_trade_count = 0
+
+    for key, trades in grouped_trades.items():
+        _, group_platform, group_code = key
+        lots = []
+        trades.sort(key=lambda x: (x["Date"], x["Created time"], x["Notion Page ID"]))
+
+        try:
+            for trade in trades:
+                trade_date = _date_key(trade["Date"])
+                if trade["Action"] == "Buy":
+                    if trade["Count"] == 0:
+                        if trade_date == snapshot_date:
+                            realized_pnl -= trade["Trade Fee"]
+                            realized_trade_count += 1
+                        continue
+
+                    unit_cost = ((trade["Count"] * trade["Price"]) + trade["Trade Fee"]) / trade["Count"]
+                    lots.append({"Count": trade["Count"], "Unit Price": unit_cost})
+                    continue
+
+                sell_count = trade["Count"]
+                held_count = sum(lot["Count"] for lot in lots)
+                if sell_count > held_count:
+                    raise ValueError(
+                        f"{group_code} 在 {trade['Date']} 卖出 {sell_count} 股，但此前可用持仓只有 {held_count} 股"
+                    )
+
+                cost_basis = 0.0
+                lots.sort(key=lambda x: x["Unit Price"])
+                while sell_count > 0:
+                    lot = lots[0]
+                    used = min(sell_count, lot["Count"])
+                    cost_basis += used * lot["Unit Price"]
+                    lot["Count"] -= used
+                    sell_count -= used
+
+                    if lot["Count"] == 0:
+                        lots.pop(0)
+
+                if trade_date == snapshot_date:
+                    realized_pnl += (trade["Count"] * trade["Price"]) - trade["Trade Fee"] - cost_basis
+                    realized_trade_count += 1
+        except Exception as e:
+            errors.append(f"{group_code} {group_platform or ''}: {e}")
+
+    return realized_pnl, realized_trade_count, errors
+
+
+def _calculate_cumulative_realized_pnl_until(market: str, snapshot_date: str, platform: str | None = None) -> tuple[float, float, list[str]]:
+    trans_ds_id = DB_TRANS_HK if market == "HK" else DB_TRANS_US
+    platform_filter = _normalize_platform(market, platform) if market == "HK" else ""
+    grouped_trades = defaultdict(list)
+    errors = []
+
+    for row in _query_all_rows(trans_ds_id):
+        trade = _trade_from_row(market, row)
+        if not trade:
+            continue
+        if _is_excluded_daily_pnl_trade(market, trade):
+            continue
+        if _date_key(trade["Date"]) > snapshot_date:
+            continue
+        if market == "HK" and trade["Platform"] != platform_filter:
+            continue
+        if _is_excluded_daily_pnl_key(market, trade["Stock Code"], trade["Platform"]):
+            continue
+        if _is_manual_daily_pnl_cost_key(market, trade["Stock Code"], trade["Platform"]):
+            continue
+        key = _group_key(market, trade["Stock Code"], trade["Platform"])
+        grouped_trades[key].append(trade)
+
+    cumulative_realized_pnl = 0.0
+    cumulative_cost_basis = 0.0
+
+    for key, trades in grouped_trades.items():
+        _, group_platform, group_code = key
+        lots = []
+        trades.sort(key=lambda x: (x["Date"], x["Created time"], x["Notion Page ID"]))
+
+        try:
+            for trade in trades:
+                if trade["Action"] == "Buy":
+                    if trade["Count"] == 0:
+                        cumulative_realized_pnl -= trade["Trade Fee"]
+                        continue
+
+                    unit_cost = ((trade["Count"] * trade["Price"]) + trade["Trade Fee"]) / trade["Count"]
+                    cumulative_cost_basis += trade["Count"] * unit_cost
+                    lots.append({"Count": trade["Count"], "Unit Price": unit_cost})
+                    continue
+
+                sell_count = trade["Count"]
+                held_count = sum(lot["Count"] for lot in lots)
+                if sell_count > held_count:
+                    raise ValueError(
+                        f"{group_code} 在 {trade['Date']} 卖出 {sell_count} 股，但此前可用持仓只有 {held_count} 股"
+                    )
+
+                cost_basis = 0.0
+                lots.sort(key=lambda x: x["Unit Price"])
+                while sell_count > 0:
+                    lot = lots[0]
+                    used = min(sell_count, lot["Count"])
+                    cost_basis += used * lot["Unit Price"]
+                    lot["Count"] -= used
+                    sell_count -= used
+
+                    if lot["Count"] == 0:
+                        lots.pop(0)
+
+                cumulative_realized_pnl += (trade["Count"] * trade["Price"]) - trade["Trade Fee"] - cost_basis
+        except Exception as e:
+            errors.append(f"{group_code} {group_platform or ''}: {e}")
+
+    return cumulative_realized_pnl, cumulative_cost_basis, errors
+
+
+def _calculate_unrealized_pnl_snapshot(market: str, platform: str | None = None) -> dict:
+    """
+    Calculate current-day unrealized P&L from position rows.
+
+    Formula:
+      unrealized = (Current Price - T-1 Closing Price) * Count
+      denominator = T-1 Closing Price * Count
+    """
+    unrealized_pnl = 0.0
+    gross_exposure = 0.0
+    market_value = 0.0
+    open_cost_basis = 0.0
+    position_count = 0
+    skipped = []
+    manual_open_cost_basis = 0.0
+    platform_filter = _normalize_platform(market, platform) if market == "HK" else ""
+
+    for row in _query_positions(market):
+        props = row.get("properties", {})
+        code = _prop_text(props, "Stock Code") or row.get("id", "")
+        row_platform = _prop_select(props, "Platform") if market == "HK" else ""
+        if market == "HK" and row_platform != platform_filter:
+            continue
+        if _is_excluded_daily_pnl_key(market, code, row_platform):
+            continue
+        count = _prop_number(props, "Count")
+        if count <= 0:
+            continue
+
+        current_price = _prop_number(props, "Current Price")
+        t1_price = _prop_number(props, "T-1 Closing Price")
+        unit_price = _prop_number(props, "Unit Price")
+        if current_price <= 0 or t1_price <= 0:
+            skipped.append(code)
+            continue
+
+        unrealized_pnl += (current_price - t1_price) * count
+        gross_exposure += t1_price * count
+        market_value += current_price * count
+        position_open_cost = unit_price * count
+        open_cost_basis += position_open_cost
+        if _is_manual_daily_pnl_cost_key(market, code, row_platform):
+            manual_open_cost_basis += position_open_cost
+        position_count += 1
+
+    return {
+        "unrealized_pnl": unrealized_pnl,
+        "gross_exposure": gross_exposure,
+        "market_value": market_value,
+        "open_cost_basis": open_cost_basis,
+        "cumulative_unrealized_pnl": market_value - open_cost_basis,
+        "position_count": position_count,
+        "manual_open_cost_basis": manual_open_cost_basis,
+        "skipped": skipped,
+    }
+
+
+def _query_daily_pnl_row(ds_id: str, snapshot_date: str, market: str, platform: str | None = None) -> dict | None:
+    query_filter = {"property": DAILY_PNL_DATE_PROPERTY, "date": {"equals": snapshot_date}}
+    if market == "HK" and DB_DAILY_PNL_HK and ds_id == DB_DAILY_PNL_HK:
+        query_filter = {
+            "and": [
+                query_filter,
+                {"property": DAILY_PNL_MARKET_PROPERTY, "select": {"equals": market}},
+                {"property": DAILY_PNL_PLATFORM_PROPERTY, "select": {"equals": _daily_pnl_platform_label(market, platform)}},
+            ]
+        }
+
+    resp = notion.data_sources.query(data_source_id=ds_id, filter=query_filter, page_size=1)
+    results = resp.get("results", [])
+    return results[0] if results else None
+
+
+def _daily_pnl_properties(market: str, snapshot_date: str, snapshot: dict, platform: str | None = None) -> dict:
+    platform_label = _daily_pnl_platform_label(market, platform)
+    title = f"{snapshot_date} {market} {platform_label}"
+    properties = {
+        DAILY_PNL_TITLE_PROPERTY: {"title": [{"text": {"content": title}}]},
+        DAILY_PNL_DATE_PROPERTY: {"date": {"start": snapshot_date}},
+        DAILY_PNL_MARKET_PROPERTY: {"select": {"name": market}},
+        "D Rlzd": {"number": round(snapshot["realized_pnl"], 4)},
+        "Cum Rlzd": {"number": round(snapshot.get("cumulative_realized_pnl", 0), 4)},
+        "Open Cost": {"number": round(snapshot.get("open_cost_basis", 0), 4)},
+        "Cum Cost": {"number": round(snapshot.get("cumulative_cost_basis", 0), 4)},
+        "T-1 MV": {"number": round(snapshot["gross_exposure"], 4)},
+        "Mkt Value": {"number": round(snapshot["market_value"], 4)},
+        "Pos Cnt": {"number": snapshot["position_count"]},
+        "Trade Cnt": {"number": snapshot["realized_trade_count"]},
+        "Snapshot": {"date": {"start": snapshot["snapshot_time"]}},
+        "Notes": {"rich_text": [{"text": {"content": snapshot["notes"][:1900]}}]},
+    }
+    if market == "HK" and DB_DAILY_PNL_HK:
+        properties[DAILY_PNL_PLATFORM_PROPERTY] = {"select": {"name": platform_label}}
+    return properties
+
+
+def upsert_daily_pnl_snapshot(market: str, snapshot_date: str, snapshot: dict, platform: str | None = None) -> str:
+    """Create or update one daily P&L row. Returns created/updated."""
+    ds_id = _daily_pnl_ds_id(market, platform)
+    if not ds_id:
+        suffix = f"_{platform.upper()}" if platform else ""
+        raise ValueError(f"缺少 DB_DAILY_PNL_{market}{suffix}")
+
+    properties = _daily_pnl_properties(market, snapshot_date, snapshot, platform)
+    existing = _query_daily_pnl_row(ds_id, snapshot_date, market, platform)
+
+    if existing:
+        notion.pages.update(page_id=existing["id"], properties=properties)
+        return "updated"
+
+    notion.pages.create(
+        parent={"type": "data_source_id", "data_source_id": ds_id},
+        properties=properties,
+    )
+    return "created"
+
+
+def sync_daily_pnl_snapshot(market: str | None = None, snapshot_date: str | None = None, platform: str | None = None):
+    """
+    Upsert daily P&L snapshots for HK/US.
+
+    Required Notion tables:
+      DB_DAILY_PNL_HK and DB_DAILY_PNL_US. HK rows are separated by Platform.
+    """
+    try:
+        markets = [market] if market else ["HK", "US"]
+        updated = 0
+        created = 0
+        missing = []
+        warnings = []
+
+        for current_market in markets:
+            current_date = snapshot_date or _today_for_market(current_market)
+            for current_platform in _daily_pnl_platforms(current_market, platform):
+                ds_id = _daily_pnl_ds_id(current_market, current_platform)
+                if not ds_id:
+                    missing.append(f"DB_DAILY_PNL_{current_market}")
+                    continue
+
+                realized_pnl, realized_trade_count, realized_errors = _calculate_realized_pnl_for_date(
+                    current_market,
+                    current_date,
+                    current_platform,
+                )
+                cumulative_realized_pnl, cumulative_cost_basis, cumulative_errors = _calculate_cumulative_realized_pnl_until(
+                    current_market,
+                    current_date,
+                    current_platform,
+                )
+                unrealized = _calculate_unrealized_pnl_snapshot(current_market, current_platform)
+                cumulative_cost_basis += unrealized.get("manual_open_cost_basis", 0.0)
+
+                gross_exposure = unrealized["gross_exposure"]
+                unrealized_pnl = unrealized["unrealized_pnl"]
+                total_pnl = realized_pnl + unrealized_pnl
+                cumulative_unrealized_pnl = unrealized["cumulative_unrealized_pnl"]
+                cumulative_total_pnl = cumulative_realized_pnl + cumulative_unrealized_pnl
+
+                note_parts = []
+                if unrealized["skipped"]:
+                    note_parts.append("Skipped positions missing Current Price or T-1 Closing Price: " + ", ".join(unrealized["skipped"][:20]))
+                if realized_errors:
+                    note_parts.append("Realized P&L errors: " + " | ".join(realized_errors[:5]))
+                if cumulative_errors:
+                    note_parts.append("Cumulative P&L errors: " + " | ".join(cumulative_errors[:5]))
+                notes = "；".join(note_parts)
+
+                snapshot = {
+                    "realized_pnl": realized_pnl,
+                    "realized_pnl_pct": _safe_pct(realized_pnl, gross_exposure),
+                    "unrealized_pnl": unrealized_pnl,
+                    "unrealized_pnl_pct": _safe_pct(unrealized_pnl, gross_exposure),
+                    "total_pnl": total_pnl,
+                    "total_pnl_pct": _safe_pct(total_pnl, gross_exposure),
+                    "cumulative_realized_pnl": cumulative_realized_pnl,
+                    "cumulative_realized_pnl_pct": _safe_pct(cumulative_realized_pnl, cumulative_cost_basis),
+                    "cumulative_unrealized_pnl": cumulative_unrealized_pnl,
+                    "cumulative_unrealized_pnl_pct": _safe_pct(cumulative_unrealized_pnl, cumulative_cost_basis),
+                    "cumulative_total_pnl": cumulative_total_pnl,
+                    "cumulative_total_pnl_pct": _safe_pct(cumulative_total_pnl, cumulative_cost_basis),
+                    "open_cost_basis": unrealized["open_cost_basis"],
+                    "cumulative_cost_basis": cumulative_cost_basis,
+                    "gross_exposure": gross_exposure,
+                    "market_value": unrealized["market_value"],
+                    "position_count": unrealized["position_count"],
+                    "realized_trade_count": realized_trade_count,
+                    "snapshot_time": _snapshot_time_for_market(current_market),
+                    "notes": notes,
+                }
+                result = upsert_daily_pnl_snapshot(current_market, current_date, snapshot, current_platform)
+                if result == "updated":
+                    updated += 1
+                else:
+                    created += 1
+
+                if notes:
+                    platform_label = f" {current_platform}" if current_platform else ""
+                    warnings.append(f"{current_market}{platform_label}: {notes}")
+
+        if missing:
+            return {
+                "status": "warning",
+                "msg": "缺少每日盈亏表环境变量: " + ", ".join(missing),
+                "updated": updated,
+                "created": created,
+                "warnings": warnings,
+            }
+
+        status = "success" if not warnings else "warning"
+        msg = f"已更新 {updated} 行，已新建 {created} 行"
+        if warnings:
+            msg += "；提示: " + " | ".join(warnings[:3])
+        return {"status": status, "msg": msg, "updated": updated, "created": created, "warnings": warnings}
+    except Exception as e:
+        logging.error(f"[Daily P&L] 同步失败: {str(e)}")
         return {"status": "error", "msg": str(e)}
 
 
