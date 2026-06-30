@@ -51,9 +51,10 @@
 - **期权 ATM 探针**: `fetch_option_snapshot` — 智能选期（本周末 + 中期 + 四周后，自适应调整避免日期过近），提取 ATM Call/Put 的 IV/OI。
 - **AI 多通道调用引擎**:
   - `_call_openai_compatible` — 通用底层引擎，适配任何 OpenAI 兼容端点，内置指数退避重试 + 随机抖动（±25%），支持 429/500/502/503/504 状态码重试。
+  - `_call_deepseek` — DeepSeek 官方 API 通道薄包装，默认模型 `deepseek-v4-pro`，支持通过环境变量覆盖。
   - `_call_openclaw` — OpenClaw 网关通道薄包装。
   - `_call_new_api` — VPS new-api 通道薄包装，支持多提供商配置（当前 Vertex_AI/Gemini）。
-  - `call_ai_with_retry` — 统一入口，按优先级链 `NewAPI/Vertex_AI → OpenClaw` 依次尝试，失败自动降级。全局 `threading.Lock` 串行化防雪崩。
+  - `call_ai_with_retry` — 统一入口，按优先级链 `DeepSeek → NewAPI/Vertex_AI → OpenClaw` 依次尝试，失败自动降级。全局 `threading.Lock` 串行化防雪崩。
   - `resolve_ai_model_name` / `format_ai_meta_footer` — AI 元数据解析与格式化（通道/提供商/模型名 + Token 用量）。
 
 #### 盘前谋划 (`premarket_planner.py`, 946 行)
@@ -231,6 +232,9 @@ AI 模型做决定的"大纲"和"性格设计"。
 | `TG_CHANNEL_ID_ORDER` | TG Order 频道 ID | `longbridge_server.py`, `intraday_sentry.py` |
 | `TG_CHAT_ID` | TG 管理员用户 ID (鉴权) | `tg_trade_bot.py` |
 | `TAVILY_API_KEY` | Tavily Search API Key | `shared_utils.py` |
+| `DEEPSEEK_API_KEY` | DeepSeek 官方 API Key；配置后成为 AI 调用队列第一优先级 | `shared_utils.py` |
+| `DEEPSEEK_BASE_URL` | DeepSeek API 基础 URL，默认 `https://api.deepseek.com` | `shared_utils.py` |
+| `DEEPSEEK_MODEL` | DeepSeek 模型名，默认 `deepseek-v4-pro` | `shared_utils.py` |
 | `OPENCLAW_GATEWAY_TOKEN` | OpenClaw 网关 Token | `shared_utils.py` |
 | `NEW_API_BASE_URL` | VPS new-api 基础 URL | `shared_utils.py` |
 | `NEW_API_KEY_Vertex_AI` | new-api Vertex AI 渠道 Key | `shared_utils.py` |

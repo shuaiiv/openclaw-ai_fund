@@ -50,6 +50,10 @@ OPENCLAW_HEADERS = {
     "x-openclaw-scopes": "operator.admin,operator.write",
 }
 
+DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+
 # ==========================================================
 # 🛠️ 缓存读写
 # ==========================================================
@@ -384,7 +388,7 @@ def fetch_option_snapshot(symbol: str, current_price: float) -> str:
 #
 # 🏗️ 架构说明：
 #   _call_openai_compatible  — 通用底层引擎，适配任何 OpenAI 兼容端点
-#   _call_openclaw / _call_new_api — 薄包装，提供各自的 URL/Header/Model
+#   _call_deepseek / _call_openclaw / _call_new_api — 薄包装，提供各自的 URL/Header/Model
 #   call_ai_with_retry       — 入口方法，按优先级列表依次尝试，失败降级
 #
 # ⚠️ 防雪崩措施：
@@ -411,7 +415,6 @@ def _backoff_with_jitter(base: float) -> float:
     """在 base 基础上添加 ±25% 随机抖动，防止多请求同步重试撞车"""
     jitter = base * _JITTER_RATIO
     return base + _random.uniform(-jitter, jitter)
-
 
 
 # ----------------------------------------------------------
@@ -602,9 +605,32 @@ def format_ai_meta_footer(ai_model_name: str | None, metadata: dict | None) -> s
 # ----------------------------------------------------------
 #
 # metadata 统一字段命名：
-#   channel  — 调用链路 (OpenClaw / NewAPI)
-#   provider — 模型提供商 (Vertex_AI / Google / ...)
+#   channel  — 调用链路 (DeepSeek / OpenClaw / NewAPI)
+#   provider — 模型提供商 (DeepSeek / Vertex_AI / Google / ...)
 #   name     — 模型名 (gemini-3.1-pro-preview / ...)
+
+def _call_deepseek(messages, *, max_tokens, timeout, caller_label):
+    """DeepSeek 官方 API 通道（OpenAI 兼容格式）。"""
+    if not DEEPSEEK_API_KEY:
+        return None, "未配置 DeepSeek API key，请在 .env 中设置 DEEPSEEK_API_KEY", None
+
+    content, error, metadata = _call_openai_compatible(
+        url=f"{DEEPSEEK_BASE_URL.rstrip('/')}/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        },
+        model=DEEPSEEK_MODEL,
+        messages=messages,
+        max_tokens=max_tokens,
+        timeout=timeout,
+        caller_label=f"{caller_label}|DeepSeek",
+    )
+    if metadata:
+        metadata["channel"] = "DeepSeek"
+        metadata["provider"] = "DeepSeek"
+    return content, error, metadata
+
 
 def _call_openclaw(messages, *, max_tokens, timeout, caller_label):
     """OpenClaw 网关通道（provider 和 name 由 AI 自报 _ai_model 字段提供）"""
@@ -686,7 +712,8 @@ def _call_new_api(messages, *, max_tokens, timeout, caller_label, provider="Vert
 # 如需指定不同的 NewAPI 提供商，用 lambda 传参：
 #   ("NewAPI/OpenAI", lambda m, **kw: _call_new_api(m, provider="OpenAI", **kw)),
 _AI_PROVIDER_CHAIN = [
-    ("NewAPI/Vertex_AI", _call_new_api),   # 默认 provider="Vertex_AI"
+    ("DeepSeek",         _call_deepseek),   # 默认 provider="DeepSeek"
+    ("NewAPI/Vertex_AI", _call_new_api),
     ("OpenClaw",         _call_openclaw),
 ]
 
@@ -705,7 +732,7 @@ def call_ai_with_retry(
     """
     AI 调用入口 — 按优先级依次尝试多个 channel，失败自动降级。
 
-    当前优先级: NewAPI/Vertex_AI → OpenClaw
+    当前优先级: DeepSeek → NewAPI/Vertex_AI → OpenClaw
 
     参数:
         messages     : OpenAI 兼容 messages 列表
@@ -762,6 +789,25 @@ def call_new_api(
         return _call_new_api(
             messages,
             provider=provider,
+            max_tokens=max_tokens,
+            timeout=timeout,
+            caller_label=caller_label,
+        )
+
+
+def call_deepseek(
+    messages: list[dict],
+    *,
+    max_tokens: int = 8192,
+    timeout: int = 360,
+    caller_label: str = "DeepSeek",
+) -> tuple[str | None, str | None, dict | None]:
+    """
+    直接调用 DeepSeek 官方 API 的独立入口（不走降级链）。
+    """
+    with _ai_call_lock:
+        return _call_deepseek(
+            messages,
             max_tokens=max_tokens,
             timeout=timeout,
             caller_label=caller_label,
