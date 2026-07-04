@@ -97,7 +97,7 @@
 - **网格触线裁决流程** (`process_grid_trigger`):
   1. 统一数据采集 (`_collect_market_data`): 账户状态、静态信息、估值指标、市场温度、资金流向、今日 5 分钟 K 线（美股按盘前/盘中/盘后分段）、期权探针、今日订单、盘前缓存快照。
   2. 新闻策略: 日内波动 ≥2% 时才调用 Tavily，节省 API 配额。
-  3. AI 裁决 (`call_ai` + `INTRADAY_SENTRY_PROMPT`): max_tokens=8192, timeout=180s。
+  3. AI 裁决 (`call_ai` + `INTRADAY_SENTRY_PROMPT`): max_tokens=16384, timeout=180s。
   4. 结果处理 (`handle_ai_verdict`): 正则提取 `[ACTION: BUY/SELL/HOLD, QTY:, PRICE:, REASON:]` 指令 → 调用 `submit_trade_order` 实盘下单 → 根据交易/观望分别更新网格 JSON（交易时写入 `pending_order` 锁 + 短冷却 5 分钟，观望时全面吸收 AI 新网格 + 长冷却 30 分钟）。
   5. 战术冷却: 每次处理完强制 60 秒休眠。
 - **订单事件重构流程** (`process_order_event`):

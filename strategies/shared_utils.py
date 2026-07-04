@@ -434,6 +434,7 @@ def _call_openai_compatible(
     max_tokens: int,
     timeout: int,
     caller_label: str,
+    extra_body: dict | None = None,
 ) -> tuple[str | None, str | None, dict | None]:
     """
     向任意 OpenAI Chat Completions 兼容端点发送请求，内置重试与退避。
@@ -448,14 +449,18 @@ def _call_openai_compatible(
     last_error = ""
     for attempt in range(_MAX_RETRIES + 1):
         try:
+            payload = {
+                "model": model,
+                "messages": messages,
+                "max_tokens": max_tokens,
+            }
+            if extra_body:
+                payload.update(extra_body)
+
             res = requests.post(
                 url,
                 headers=headers,
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": max_tokens,
-                },
+                json=payload,
                 timeout=timeout,
             )
 
@@ -466,11 +471,13 @@ def _call_openai_compatible(
                 finish_reason = resp_body["choices"][0].get("finish_reason", "stop")
 
                 usage = resp_body.get("usage", {})
+                completion_details = usage.get("completion_tokens_details", {})
                 raw_model = resp_body.get("model", model)
                 metadata = {
                     "name": raw_model,
                     "prompt_tokens": usage.get("prompt_tokens", 0),
                     "completion_tokens": usage.get("completion_tokens", 0),
+                    "reasoning_tokens": completion_details.get("reasoning_tokens", 0),
                     "total_tokens": usage.get("total_tokens", 0),
                 }
 
@@ -600,6 +607,9 @@ def format_ai_meta_footer(ai_model_name: str | None, metadata: dict | None) -> s
         f"输出 {metadata.get('completion_tokens', 0):,} = "
         f"合计 {metadata.get('total_tokens', 0):,}"
     )
+    reasoning_tokens = metadata.get("reasoning_tokens", 0)
+    if reasoning_tokens:
+        parts.append(f"🧠 Reasoning Token: {reasoning_tokens:,}")
 
     return "\n━━━━━━━━━━━━━━━━━━━━━\n" + "\n".join(parts)
 
@@ -629,6 +639,10 @@ def _call_deepseek(messages, *, max_tokens, timeout, caller_label):
         max_tokens=max_tokens,
         timeout=timeout,
         caller_label=f"{caller_label}|DeepSeek",
+        extra_body={
+            "thinking": {"type": "enabled"},
+            "reasoning_effort": "high",
+        },
     )
     if metadata:
         metadata["channel"] = "DeepSeek"
@@ -729,7 +743,7 @@ _AI_PROVIDER_CHAIN = [
 def call_ai_with_retry(
     messages: list[dict],
     *,
-    max_tokens: int = 8192,
+    max_tokens: int = 16384,
     timeout: int = 360,
     caller_label: str = "AI",
 ) -> tuple[str | None, str | None, dict | None]:
@@ -740,7 +754,7 @@ def call_ai_with_retry(
 
     参数:
         messages     : OpenAI 兼容 messages 列表
-        max_tokens   : AI 回复的最大 token 数（防截断，默认 8192）
+        max_tokens   : AI 回复的最大 token 数（防截断，默认 16384）
         timeout      : 单次请求超时秒数；DeepSeek 默认受 DEEPSEEK_TIMEOUT 上限约束
         caller_label : 日志/通知中使用的调用方标识
 
@@ -748,7 +762,7 @@ def call_ai_with_retry(
         成功时 content 为 AI 回复文本, error_msg 为 None
         失败时 content 为 None, error_msg 为所有通道的错误汇总
         metadata 字段: channel(调用链路), provider(提供商), name(模型名),
-                       prompt_tokens, completion_tokens, total_tokens
+                       prompt_tokens, completion_tokens, reasoning_tokens, total_tokens
         ⚠️ 若 AI 回复被截断 (finish_reason=length)，content 仍会返回（截断的内容），
            同时 error_msg 会包含截断警告信息。
     """
@@ -782,7 +796,7 @@ def call_new_api(
     messages: list[dict],
     *,
     provider: str = "Vertex_AI",
-    max_tokens: int = 8192,
+    max_tokens: int = 16384,
     timeout: int = 360,
     caller_label: str = "NewAPI",
 ) -> tuple[str | None, str | None, dict | None]:
@@ -803,7 +817,7 @@ def call_new_api(
 def call_deepseek(
     messages: list[dict],
     *,
-    max_tokens: int = 8192,
+    max_tokens: int = 16384,
     timeout: int = DEEPSEEK_TIMEOUT,
     caller_label: str = "DeepSeek",
 ) -> tuple[str | None, str | None, dict | None]:
@@ -822,7 +836,7 @@ def call_deepseek(
 def call_openclaw(
     messages: list[dict],
     *,
-    max_tokens: int = 8192,
+    max_tokens: int = 16384,
     timeout: int = 360,
     caller_label: str = "OpenClaw",
 ) -> tuple[str | None, str | None, dict | None]:

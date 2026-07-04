@@ -631,7 +631,7 @@ def call_ai(wake_msg: str, sys_prompt: str) -> tuple[str | None, dict | None]:
             {"role": "system", "content": sys_prompt},
             {"role": "user",   "content": wake_msg},
         ],
-        max_tokens=8192,   # 盘中裁决输出空间
+        max_tokens=16384,  # 盘中裁决输出空间
         timeout=180,
         caller_label="盘中哨兵",
     )
