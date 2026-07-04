@@ -11,6 +11,7 @@ Notion 每日盈亏看板
   NOTION_TOKEN
   DB_DAILY_PNL_HK
   DB_DAILY_PNL_US
+  PNL_DASHBOARD_DATA_FILE=notion/pnl_dashboard_data.json
   PNL_DASHBOARD_HOST=127.0.0.1
   PNL_DASHBOARD_PORT=8765
 """
@@ -20,8 +21,10 @@ from __future__ import annotations
 import json
 import os
 import sys
-from datetime import datetime
+import tempfile
+from datetime import date, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from threading import RLock
 from urllib.parse import parse_qs, urlparse
 
 from dotenv import load_dotenv, find_dotenv
@@ -31,7 +34,6 @@ from notion_client import Client
 from notion_database_manager import (
     _daily_pnl_ds_id,
     _daily_pnl_platform_label,
-    _normalize_platform,
     _safe_pct,
 )
 
@@ -42,6 +44,13 @@ DB_DAILY_PNL_HK = os.getenv("DB_DAILY_PNL_HK")
 DB_DAILY_PNL_US = os.getenv("DB_DAILY_PNL_US")
 HOST = os.getenv("PNL_DASHBOARD_HOST", "127.0.0.1")
 PORT = int(os.getenv("PNL_DASHBOARD_PORT", "8765"))
+DATA_FILE = os.getenv(
+    "PNL_DASHBOARD_DATA_FILE",
+    os.path.join(os.path.dirname(__file__), "pnl_dashboard_data.json"),
+)
+
+PNL_SOURCES = (("US", None), ("HK", "Trade25"), ("HK", "Futu"))
+_STORE_LOCK = RLock()
 
 notion = Client(auth=NOTION_TOKEN) if NOTION_TOKEN else None
 
@@ -690,39 +699,158 @@ def _combine_hk_platform_rows(rows_by_platform: list[list[dict]]) -> list[dict]:
     return rows
 
 
-def _query_all_rows(ds_id: str) -> list[dict]:
+def _pnl_source_key(market: str, platform: str | None = None) -> str:
+    return f"{market}:{_daily_pnl_platform_label(market, platform)}"
+
+
+def _blank_store() -> dict:
+    return {
+        "version": 1,
+        "last_full_sync_date": "",
+        "last_full_sync_at": "",
+        "last_incremental_sync_at": "",
+        "datasets": {},
+    }
+
+
+def _load_store() -> dict:
+    if not os.path.exists(DATA_FILE):
+        return _blank_store()
+    with open(DATA_FILE, "r", encoding="utf-8") as f:
+        store = json.load(f)
+    if not isinstance(store, dict):
+        return _blank_store()
+    store.setdefault("version", 1)
+    store.setdefault("last_full_sync_date", "")
+    store.setdefault("last_full_sync_at", "")
+    store.setdefault("last_incremental_sync_at", "")
+    store.setdefault("datasets", {})
+    return store
+
+
+def _save_store(store: dict):
+    data_dir = os.path.dirname(DATA_FILE) or "."
+    os.makedirs(data_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".pnl-dashboard-", suffix=".json", dir=data_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, separators=(",", ":"))
+        os.replace(tmp_path, DATA_FILE)
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _request_sources(market: str, platform: str | None) -> list[tuple[str, str | None]]:
+    if market == "HK" and (platform or "").strip().lower() == "all":
+        return [("HK", "Trade25"), ("HK", "Futu")]
+    return [(market, platform)]
+
+
+def _all_sources_present(store: dict) -> bool:
+    datasets = store.get("datasets", {})
+    return all(_pnl_source_key(market, platform) in datasets for market, platform in PNL_SOURCES)
+
+
+def _set_source_rows(store: dict, market: str, platform: str | None, rows: list[dict]):
+    store.setdefault("datasets", {})[_pnl_source_key(market, platform)] = sorted(rows, key=lambda item: item["date"])
+
+
+def _upsert_source_rows(store: dict, market: str, platform: str | None, rows: list[dict]):
+    if not rows:
+        return
+    key = _pnl_source_key(market, platform)
+    existing = {row["date"]: row for row in store.setdefault("datasets", {}).get(key, [])}
+    for row in rows:
+        existing[row["date"]] = row
+    store["datasets"][key] = [existing[row_date] for row_date in sorted(existing)]
+
+
+def _row_from_notion_page(row: dict) -> dict | None:
+    props = row.get("properties", {})
+    row_date = _date(props, "Date")
+    if not row_date:
+        return None
+    return {
+        "date": row_date,
+        "realized_pnl": _number_any(props, "D Rlzd", "Realized P&L"),
+        "realized_pnl_pct": _number_any(props, "D Rlzd %", "Realized P&L %"),
+        "unrealized_pnl": _number_any(props, "D Unrlzd", "Unrealized P&L"),
+        "unrealized_pnl_pct": _number_any(props, "D Unrlzd %", "Unrealized P&L %"),
+        "total_pnl": _number_any(props, "D Total", "Total P&L"),
+        "total_pnl_pct": _number_any(props, "D Total %", "Total P&L %"),
+        "cumulative_realized_pnl": _number_any(props, "Cum Rlzd", "Cumulative Realized P&L"),
+        "cumulative_realized_pnl_pct": _number_any(props, "Cum Rlzd %", "Cumulative Realized P&L %"),
+        "cumulative_unrealized_pnl": _number_any(props, "Cum Unrlzd", "Cumulative Unrealized P&L"),
+        "cumulative_unrealized_pnl_pct": _number_any(props, "Cum Unrlzd %", "Cumulative Unrealized P&L %"),
+        "cumulative_total_pnl": _number_any(props, "Cum Total", "Cumulative Total P&L"),
+        "cumulative_total_pnl_pct": _number_any(props, "Cum Total %", "Cumulative Total P&L %"),
+        "open_cost_basis": _number_any(props, "Open Cost", "Open Cost Basis"),
+        "cumulative_cost_basis": _number_any(props, "Cum Cost", "Cumulative Cost Basis"),
+        "gross_exposure": _number_any(props, "T-1 MV", "Gross Exposure"),
+        "market_value": _number_any(props, "Mkt Value", "Market Value"),
+        "position_count": int(_number_any(props, "Pos Cnt", "Position Count")),
+        "realized_trade_count": int(_number_any(props, "Trade Cnt", "Realized Trade Count")),
+    }
+
+
+def _pnl_query_filter(market: str, platform: str | None, start: str | None = None, end: str | None = None) -> dict | None:
+    filters = []
+    if start:
+        filters.append({"property": "Date", "date": {"on_or_after": start}})
+    if end:
+        filters.append({"property": "Date", "date": {"on_or_before": end}})
+    if market == "HK" and DB_DAILY_PNL_HK:
+        filters.extend([
+            {"property": "Market", "select": {"equals": market}},
+            {"property": "Platform", "select": {"equals": _daily_pnl_platform_label(market, platform)}},
+        ])
+    if not filters:
+        return None
+    if len(filters) == 1:
+        return filters[0]
+    return {"and": filters}
+
+
+def _query_pnl_pages(
+    ds_id: str,
+    market: str,
+    platform: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+    latest_only: bool = False,
+) -> list[dict]:
     rows = []
     cursor = None
     while True:
-        kwargs = {"data_source_id": ds_id, "page_size": 100}
+        kwargs = {
+            "data_source_id": ds_id,
+            "page_size": 1 if latest_only else 100,
+        }
+        query_filter = _pnl_query_filter(market, platform, start, end)
+        if query_filter:
+            kwargs["filter"] = query_filter
+        if latest_only:
+            kwargs["sorts"] = [{"property": "Date", "direction": "descending"}]
         if cursor:
             kwargs["start_cursor"] = cursor
         resp = notion.data_sources.query(**kwargs)
         rows.extend(resp.get("results", []))
-        if not resp.get("has_more"):
+        if latest_only or not resp.get("has_more"):
             break
         cursor = resp.get("next_cursor")
     return rows
 
 
-def _load_pnl_rows(
+def _fetch_pnl_rows_from_notion(
     market: str,
-    days: int = 0,
     platform: str | None = None,
     start: str | None = None,
     end: str | None = None,
+    latest_only: bool = False,
 ) -> list[dict]:
     if notion is None:
         raise RuntimeError("缺少 NOTION_TOKEN")
-
-    if market == "HK" and (platform or "").strip().lower() == "all":
-        rows = _combine_hk_platform_rows([
-            _load_pnl_rows("HK", 0, "Trade25", start, end),
-            _load_pnl_rows("HK", 0, "Futu", start, end),
-        ])
-        if days > 0:
-            rows = rows[-days:]
-        return rows
 
     try:
         ds_id = _daily_pnl_ds_id(market, platform)
@@ -734,46 +862,76 @@ def _load_pnl_rows(
 
     rows = []
     expected_platform = _daily_pnl_platform_label(market, platform)
-    for row in _query_all_rows(ds_id):
+    for row in _query_pnl_pages(ds_id, market, platform, start, end, latest_only):
         props = row.get("properties", {})
         if market == "HK" and DB_DAILY_PNL_HK and ds_id == DB_DAILY_PNL_HK:
             if _select(props, "Market") != market:
                 continue
             if _select(props, "Platform") != expected_platform:
                 continue
-        row_date = _date(props, "Date")
-        if not row_date:
-            continue
-        if start and row_date < start:
-            continue
-        if end and row_date > end:
-            continue
-        rows.append({
-            "date": row_date,
-            "realized_pnl": _number_any(props, "D Rlzd", "Realized P&L"),
-            "realized_pnl_pct": _number_any(props, "D Rlzd %", "Realized P&L %"),
-            "unrealized_pnl": _number_any(props, "D Unrlzd", "Unrealized P&L"),
-            "unrealized_pnl_pct": _number_any(props, "D Unrlzd %", "Unrealized P&L %"),
-            "total_pnl": _number_any(props, "D Total", "Total P&L"),
-            "total_pnl_pct": _number_any(props, "D Total %", "Total P&L %"),
-            "cumulative_realized_pnl": _number_any(props, "Cum Rlzd", "Cumulative Realized P&L"),
-            "cumulative_realized_pnl_pct": _number_any(props, "Cum Rlzd %", "Cumulative Realized P&L %"),
-            "cumulative_unrealized_pnl": _number_any(props, "Cum Unrlzd", "Cumulative Unrealized P&L"),
-            "cumulative_unrealized_pnl_pct": _number_any(props, "Cum Unrlzd %", "Cumulative Unrealized P&L %"),
-            "cumulative_total_pnl": _number_any(props, "Cum Total", "Cumulative Total P&L"),
-            "cumulative_total_pnl_pct": _number_any(props, "Cum Total %", "Cumulative Total P&L %"),
-            "open_cost_basis": _number_any(props, "Open Cost", "Open Cost Basis"),
-            "cumulative_cost_basis": _number_any(props, "Cum Cost", "Cumulative Cost Basis"),
-            "gross_exposure": _number_any(props, "T-1 MV", "Gross Exposure"),
-            "market_value": _number_any(props, "Mkt Value", "Market Value"),
-            "position_count": int(_number_any(props, "Pos Cnt", "Position Count")),
-            "realized_trade_count": int(_number_any(props, "Trade Cnt", "Realized Trade Count")),
-        })
+        parsed = _row_from_notion_page(row)
+        if parsed:
+            rows.append(parsed)
 
     rows.sort(key=lambda item: item["date"])
-    if days > 0:
-        rows = rows[-days:]
     return rows
+
+
+def _full_sync_store(today: str) -> dict:
+    store = _blank_store()
+    for market, platform in PNL_SOURCES:
+        _set_source_rows(store, market, platform, _fetch_pnl_rows_from_notion(market, platform))
+    store["last_full_sync_date"] = today
+    store["last_full_sync_at"] = datetime.now().isoformat(timespec="seconds")
+    _save_store(store)
+    return store
+
+
+def _sync_store_for_request(market: str, platform: str | None) -> dict:
+    today = date.today().isoformat()
+    with _STORE_LOCK:
+        store = _load_store()
+        if store.get("last_full_sync_date") != today or not _all_sources_present(store):
+            return _full_sync_store(today)
+
+        for source_market, source_platform in _request_sources(market, platform):
+            latest_rows = _fetch_pnl_rows_from_notion(source_market, source_platform, latest_only=True)
+            _upsert_source_rows(store, source_market, source_platform, latest_rows)
+        store["last_incremental_sync_at"] = datetime.now().isoformat(timespec="seconds")
+        _save_store(store)
+        return store
+
+
+def _filter_local_rows(rows: list[dict], days: int, start: str | None, end: str | None) -> list[dict]:
+    filtered = [
+        row for row in rows
+        if (not start or row["date"] >= start) and (not end or row["date"] <= end)
+    ]
+    filtered.sort(key=lambda item: item["date"])
+    if days > 0:
+        filtered = filtered[-days:]
+    return filtered
+
+
+def _load_pnl_rows(
+    market: str,
+    days: int = 0,
+    platform: str | None = None,
+    start: str | None = None,
+    end: str | None = None,
+) -> list[dict]:
+    store = _sync_store_for_request(market, platform)
+    datasets = store.get("datasets", {})
+
+    if market == "HK" and (platform or "").strip().lower() == "all":
+        rows = _combine_hk_platform_rows([
+            datasets.get(_pnl_source_key("HK", "Trade25"), []),
+            datasets.get(_pnl_source_key("HK", "Futu"), []),
+        ])
+        return _filter_local_rows(rows, days, start, end)
+
+    rows = datasets.get(_pnl_source_key(market, platform), [])
+    return _filter_local_rows(rows, days, start, end)
 
 
 def _json_response(handler: BaseHTTPRequestHandler, payload: dict, status: int = 200):
