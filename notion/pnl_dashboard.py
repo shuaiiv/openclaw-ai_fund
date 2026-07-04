@@ -27,6 +27,14 @@ from urllib.parse import parse_qs, urlparse
 from dotenv import load_dotenv, find_dotenv
 from notion_client import Client
 
+# Import shared helpers from notion_database_manager to avoid duplicate definitions
+from notion_database_manager import (
+    _daily_pnl_ds_id,
+    _daily_pnl_platform_label,
+    _normalize_platform,
+    _safe_pct,
+)
+
 load_dotenv(find_dotenv())
 
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
@@ -620,25 +628,8 @@ def _select(props: dict, name: str) -> str:
     return selected.get("name", "") if selected else ""
 
 
-def _daily_pnl_platform_label(market: str, platform: str | None = None) -> str:
-    if market == "HK":
-        normalized = (platform or "Trade25").strip().lower()
-        return "Futu" if normalized == "futu" else "Trade25"
-    if market == "US":
-        return "IBKR"
-    return platform or ""
-
-
-def _daily_pnl_ds_id(market: str, platform: str | None = None) -> str | None:
-    if market == "HK":
-        return DB_DAILY_PNL_HK
-    if market == "US":
-        return DB_DAILY_PNL_US
-    return None
-
-
-def _safe_pct(numerator: float, denominator: float) -> float:
-    return numerator / denominator if denominator else 0.0
+# _daily_pnl_platform_label, _daily_pnl_ds_id, _safe_pct
+# are imported from notion_database_manager (see top of file)
 
 
 def _empty_pnl_row(date: str) -> dict:
@@ -733,7 +724,10 @@ def _load_pnl_rows(
             rows = rows[-days:]
         return rows
 
-    ds_id = _daily_pnl_ds_id(market, platform)
+    try:
+        ds_id = _daily_pnl_ds_id(market, platform)
+    except ValueError as e:
+        raise RuntimeError(str(e)) from e
     if not ds_id:
         suffix = f"_{platform.upper()}" if market == "HK" and platform else ""
         raise RuntimeError(f"缺少 DB_DAILY_PNL_{market}{suffix}")

@@ -210,16 +210,26 @@ def _pnl_snapshot_date_for_market(market: str) -> str | None:
     return None
 
 
+def _try_live_fallback(lb_code: str, label: str):
+    """尝试用实时报价兜底获取价格，返回 (price, date_label) 或 (None, None)。"""
+    result = _logic_get_live_quote(lb_code)
+    if "error" not in result and result.get("price"):
+        return float(result["price"]), f"{label} live_close_fallback"
+    return None, None
+
+
 def _latest_daily_close(lb_code: str, target_date: str | None = None, allow_live_fallback: bool = False):
     """取最近一根历史日 K 的 close，保证和每日盈亏快照口径一致。"""
     end_date = datetime.now().date()
     start_date = end_date - timedelta(days=10)
+    fallback_label = target_date or end_date.isoformat()
+
     data = _logic_get_history_kline(lb_code, Period.Day, start_date, end_date)
     if data and isinstance(data[0], dict) and "error" in data[0]:
         if allow_live_fallback:
-            result = _logic_get_live_quote(lb_code)
-            if "error" not in result and result.get("price"):
-                return float(result["price"]), f"{target_date or end_date.isoformat()} live_close_fallback"
+            price, label = _try_live_fallback(lb_code, fallback_label)
+            if price is not None:
+                return price, label
         return None, data[0]["error"]
 
     daily_rows = [
@@ -228,17 +238,17 @@ def _latest_daily_close(lb_code: str, target_date: str | None = None, allow_live
     ]
     if not daily_rows:
         if allow_live_fallback:
-            result = _logic_get_live_quote(lb_code)
-            if "error" not in result and result.get("price"):
-                return float(result["price"]), f"{target_date or end_date.isoformat()} live_close_fallback"
+            price, label = _try_live_fallback(lb_code, fallback_label)
+            if price is not None:
+                return price, label
         return None, "历史日 K 为空"
 
     latest = daily_rows[-1]
     latest_date = _date_key(latest.get("t"))
     if allow_live_fallback and target_date and latest_date < target_date:
-        result = _logic_get_live_quote(lb_code)
-        if "error" not in result and result.get("price"):
-            return float(result["price"]), f"{target_date} live_close_fallback"
+        price, label = _try_live_fallback(lb_code, target_date)
+        if price is not None:
+            return price, label
     return float(latest["c"]), latest["t"]
 
 
@@ -363,7 +373,7 @@ def update_us_afterhours_open():
     """美股盘后开始：先切换 T-1 基准到当日收盘，再写入下一交易日快照。"""
     if not _is_trading_day("US"):
         return
-    update_t1_price("US", DB_POS_US, True)
+    update_t1_price("US", DB_POS_US, allow_live_fallback=True)
     update_current_price("US", DB_POS_US, "afterhours_open")
 
 

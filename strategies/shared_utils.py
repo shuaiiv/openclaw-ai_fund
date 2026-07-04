@@ -53,6 +53,10 @@ OPENCLAW_HEADERS = {
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-v4-pro")
+try:
+    DEEPSEEK_TIMEOUT = max(1, int(os.getenv("DEEPSEEK_TIMEOUT", "120")))
+except ValueError:
+    DEEPSEEK_TIMEOUT = 120
 
 # ==========================================================
 # 🛠️ 缓存读写
@@ -707,14 +711,14 @@ def _call_new_api(messages, *, max_tokens, timeout, caller_label, provider="Vert
 # ----------------------------------------------------------
 # 🗂️ 优先级列表 — 按顺序尝试，前者失败则降级到后者
 # ----------------------------------------------------------
-# 每项: (名称, 调用函数)
+# 每项: (名称, 调用函数, 通道超时上限)
 # 调整顺序即可改变优先级，新增渠道只需添加一行。
 # 如需指定不同的 NewAPI 提供商，用 lambda 传参：
-#   ("NewAPI/OpenAI", lambda m, **kw: _call_new_api(m, provider="OpenAI", **kw)),
+#   ("NewAPI/OpenAI", lambda m, **kw: _call_new_api(m, provider="OpenAI", **kw), None),
 _AI_PROVIDER_CHAIN = [
-    ("DeepSeek",         _call_deepseek),   # 默认 provider="DeepSeek"
-    ("NewAPI/Vertex_AI", _call_new_api),
-    ("OpenClaw",         _call_openclaw),
+    ("DeepSeek",         _call_deepseek, DEEPSEEK_TIMEOUT),   # 默认 provider="DeepSeek"
+    ("NewAPI/Vertex_AI", _call_new_api,  None),
+    ("OpenClaw",         _call_openclaw,  None),
 ]
 
 
@@ -737,7 +741,7 @@ def call_ai_with_retry(
     参数:
         messages     : OpenAI 兼容 messages 列表
         max_tokens   : AI 回复的最大 token 数（防截断，默认 8192）
-        timeout      : 单次请求超时秒数
+        timeout      : 单次请求超时秒数；DeepSeek 默认受 DEEPSEEK_TIMEOUT 上限约束
         caller_label : 日志/通知中使用的调用方标识
 
     返回: (content, error_msg, metadata)
@@ -751,12 +755,13 @@ def call_ai_with_retry(
     errors: list[str] = []
 
     with _ai_call_lock:
-        for chain_name, chain_fn in _AI_PROVIDER_CHAIN:
+        for chain_name, chain_fn, timeout_cap in _AI_PROVIDER_CHAIN:
+            request_timeout = min(timeout, timeout_cap) if timeout_cap else timeout
             print(f"🔄 [{caller_label}] 尝试通道: {chain_name}")
             content, error, metadata = chain_fn(
                 messages,
                 max_tokens=max_tokens,
-                timeout=timeout,
+                timeout=request_timeout,
                 caller_label=caller_label,
             )
 
@@ -799,7 +804,7 @@ def call_deepseek(
     messages: list[dict],
     *,
     max_tokens: int = 8192,
-    timeout: int = 360,
+    timeout: int = DEEPSEEK_TIMEOUT,
     caller_label: str = "DeepSeek",
 ) -> tuple[str | None, str | None, dict | None]:
     """
