@@ -70,6 +70,51 @@ def _render_markdown(text: str) -> str:
 
 # 切分规则：匹配所有 ``` 代码块（含或不含语言标记）
 _CODE_BLOCK_RE = re.compile(r'(```(\w*)\s*\n?(.*?)\s*```)', re.DOTALL)
+_TG_MAX_MESSAGE_CHARS = 4096
+_TG_SAFE_MARGIN_CHARS = 32
+
+
+def _parse_markdown_parts(text: str) -> list:
+    """切分普通文本与 Markdown fenced code block。"""
+    parts = []          # 元素: ('text', raw_str) 或 ('code', lang, content)
+    last_end = 0
+
+    for m in _CODE_BLOCK_RE.finditer(text):
+        before = text[last_end:m.start()]
+        if before:
+            parts.append(('text', before))
+        lang = m.group(2).lower() or 'plain'
+        content = m.group(3).strip()
+        parts.append(('code', lang, content))
+        last_end = m.end()
+
+    tail = text[last_end:]
+    if tail:
+        parts.append(('text', tail))
+    return parts
+
+
+def _render_code_html(lang: str, content: str) -> str:
+    escaped_content = _escape_html(content)
+    if lang == 'json':
+        inner = f'<pre><code class="language-json">{escaped_content}</code></pre>'
+    else:
+        inner = f'<pre><code>{escaped_content}</code></pre>'
+    return f'<blockquote expandable>{inner}</blockquote>'
+
+
+def _render_text_html(raw: str, collapse_text: bool) -> str:
+    rendered = _render_markdown(_escape_html(raw.strip()))
+    if collapse_text:
+        return f'<blockquote expandable>{rendered}</blockquote>'
+    return rendered
+
+
+def _render_part_html(part: tuple, collapse_text: bool) -> str:
+    if part[0] == 'code':
+        _, lang, content = part
+        return _render_code_html(lang, content)
+    return _render_text_html(part[1], collapse_text)
 
 
 def _format_and_build_html(text: str, max_text_len: int = 500) -> str:
@@ -79,55 +124,152 @@ def _format_and_build_html(text: str, max_text_len: int = 500) -> str:
     - 普通文字总长度 > max_text_len → 自动折叠
     - Tags 由调用方拼接在消息最底部（本函数不处理 tags）
     """
-    # ── Step 1：切分普通文本与代码块 ──────────────────────────────────────────
-    parts = []          # 元素: ('text', raw_str) 或 ('code', lang, content)
-    last_end = 0
-
-    for m in _CODE_BLOCK_RE.finditer(text):
-        # 代码块之前的普通文本
-        before = text[last_end:m.start()]
-        if before:
-            parts.append(('text', before))
-        lang = m.group(2).lower() or 'plain'
-        content = m.group(3).strip()
-        parts.append(('code', lang, content))
-        last_end = m.end()
-
-    # 尾部剩余普通文本
-    tail = text[last_end:]
-    if tail:
-        parts.append(('text', tail))
+    parts = _parse_markdown_parts(text)
 
     # ── Step 2：计算普通文本总长度，决定是否折叠 ──────────────────────────────
     normal_text_total = sum(len(p[1]) for p in parts if p[0] == 'text')
     collapse_text = normal_text_total > max_text_len
 
     # ── Step 3：逐段渲染 HTML ─────────────────────────────────────────────────
-    html_parts = []
+    html_parts = [
+        _render_part_html(part, collapse_text)
+        for part in parts
+        if part[0] == 'code' or part[1].strip()
+    ]
+    return "\n\n".join(html_parts)
+
+
+def _fits_html(raw: str, max_html_len: int, collapse_text: bool) -> bool:
+    return len(_render_text_html(raw, collapse_text)) <= max_html_len
+
+
+def _take_text_prefix(raw: str, max_html_len: int, collapse_text: bool) -> str:
+    """二分寻找渲染后不超过 TG 预算的最长普通文本前缀。"""
+    lo, hi = 1, len(raw)
+    best = 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if _fits_html(raw[:mid], max_html_len, collapse_text):
+            best = mid
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return raw[:best]
+
+
+def _split_text_html(raw: str, max_html_len: int, collapse_text: bool) -> list:
+    """按段落/换行/空格切普通文本，避免切坏 HTML 标签。"""
+    chunks = []
+    remaining = raw.strip()
+    while remaining:
+        if _fits_html(remaining, max_html_len, collapse_text):
+            chunks.append(_render_text_html(remaining, collapse_text))
+            break
+
+        prefix = _take_text_prefix(remaining, max_html_len, collapse_text)
+        cut = len(prefix)
+        split_at = -1
+        for sep in ("\n\n", "\n", " "):
+            pos = remaining.rfind(sep, 0, cut)
+            if pos > max(1, int(cut * 0.55)):
+                split_at = pos + len(sep)
+                break
+
+        if split_at <= 0:
+            split_at = cut
+
+        piece = remaining[:split_at].strip()
+        if piece:
+            chunks.append(_render_text_html(piece, collapse_text))
+        remaining = remaining[split_at:].strip()
+    return chunks
+
+
+def _split_oversized_code_html(lang: str, content: str, max_html_len: int) -> list:
+    """
+    仅在单个代码块超过 Telegram 单条硬上限时降级切分。
+    正常 JSON 会作为原子块保留在同一条消息中。
+    """
+    chunks = []
+    remaining = content.strip()
+    while remaining:
+        if len(_render_code_html(lang, remaining)) <= max_html_len:
+            chunks.append(_render_code_html(lang, remaining))
+            break
+
+        lo, hi = 1, len(remaining)
+        best = 1
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if len(_render_code_html(lang, remaining[:mid])) <= max_html_len:
+                best = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+
+        split_at = remaining.rfind("\n", 0, best)
+        if split_at <= 0:
+            split_at = best
+        piece = remaining[:split_at].strip()
+        if piece:
+            chunks.append(_render_code_html(lang, piece))
+        remaining = remaining[split_at:].strip()
+    return chunks
+
+
+def _format_and_split_html(text: str, max_html_len: int, max_text_len: int = 500) -> list:
+    """
+    将 Markdown 渲染成 TG HTML，并按 Telegram 长度限制切分。
+
+    fenced code block（尤其 ```json）作为原子块处理：只要单个代码块本身
+    没超过 TG 硬上限，就不会被切到两条消息里。
+    """
+    parts = _parse_markdown_parts(text)
+    normal_text_total = sum(len(p[1]) for p in parts if p[0] == 'text')
+    collapse_text = normal_text_total > max_text_len
+
+    chunks = []
+    current = []
+    current_len = 0
+
+    def flush():
+        nonlocal current, current_len
+        if current:
+            chunks.append("\n\n".join(current))
+            current = []
+            current_len = 0
+
+    def append_block(block: str):
+        nonlocal current_len
+        sep_len = 2 if current else 0
+        if current and current_len + sep_len + len(block) > max_html_len:
+            flush()
+            sep_len = 0
+        current.append(block)
+        current_len += sep_len + len(block)
 
     for part in parts:
-        if part[0] == 'code':
-            _, lang, content = part
-            escaped_content = _escape_html(content)
-            # JSON 代码块：带语言高亮标记；其他代码块：通用 <pre><code>
-            if lang == 'json':
-                inner = f'<pre><code class="language-json">{escaped_content}</code></pre>'
-            else:
-                inner = f'<pre><code>{escaped_content}</code></pre>'
-            # 代码块始终折叠
-            html_parts.append(f'<blockquote expandable>{inner}</blockquote>')
-
-        else:  # 'text'
+        if part[0] == 'text':
             raw = part[1].strip()
             if not raw:
                 continue
-            rendered = _render_markdown(_escape_html(raw))
-            if collapse_text:
-                html_parts.append(f'<blockquote expandable>{rendered}</blockquote>')
-            else:
-                html_parts.append(rendered)
+            for block in _split_text_html(raw, max_html_len, collapse_text):
+                append_block(block)
+            continue
 
-    return "\n\n".join(html_parts)
+        _, lang, content = part
+        block = _render_code_html(lang, content)
+        if len(block) <= max_html_len:
+            append_block(block)
+        else:
+            print(f"⚠️ TG 代码块超过单条消息上限，降级切分: lang={lang}, len={len(block)}")
+            flush()
+            for code_block in _split_oversized_code_html(lang, content, max_html_len):
+                append_block(code_block)
+                flush()
+
+    flush()
+    return chunks or [""]
 
 
 def _sync_tg_send(text: str, targets: list, parse_mode: str = None):
@@ -138,9 +280,6 @@ def _sync_tg_send(text: str, targets: list, parse_mode: str = None):
 
     # 提取通用的内容 tags（在原始文本上提取，不受 HTML 转义影响）
     content_tags = _extract_tags(text)
-
-    # 渲染正文 HTML（不含 tags）
-    html_body = _format_and_build_html(text)
 
     for bot_token, chat_id in targets:
         if not bot_token or not chat_id:
@@ -157,28 +296,34 @@ def _sync_tg_send(text: str, targets: list, parse_mode: str = None):
         allowed = 10 - len(fixed_tags)
         all_tags = fixed_tags + content_tags[:allowed]
 
-        # ── Tags 固定追加在消息最底部 ────────────────────────────────────────
-        message_html = html_body
-        if all_tags:
-            message_html = f"{html_body}\n\n{' '.join(all_tags)}"
+        # ── Tags 固定追加在消息最底部，并计入每条消息的 TG 长度预算 ─────────
+        tag_suffix = f"\n\n{' '.join(all_tags)}" if all_tags else ""
+        max_body_len = _TG_MAX_MESSAGE_CHARS - len(tag_suffix) - _TG_SAFE_MARGIN_CHARS
+        if max_body_len < 1000:
+            max_body_len = _TG_MAX_MESSAGE_CHARS - _TG_SAFE_MARGIN_CHARS
 
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message_html,
-            "parse_mode": "HTML",
-        }
+        message_chunks = _format_and_split_html(text, max_body_len)
 
-        try:
-            response = _tg_session.post(url, json=payload, timeout=10)
-            if response.status_code == 200:
-                print(f"✅ 成功推送到 ID: {chat_id}")
-            else:
-                print(f"❌ 推送失败 ID: {chat_id}, 错误详情: {response.text}")
-        except Exception as e:
-            print(f"⚠️ TG 发送异常 (ID: {chat_id}): {e}")
-        finally:
-            time.sleep(4)  # 防止触发 TG API 发送频率限制
+        for idx, html_body in enumerate(message_chunks, start=1):
+            message_html = f"{html_body}{tag_suffix}" if tag_suffix else html_body
+            payload = {
+                "chat_id": chat_id,
+                "text": message_html,
+                "parse_mode": "HTML",
+            }
+
+            try:
+                response = _tg_session.post(url, json=payload, timeout=10)
+                if response.status_code == 200:
+                    suffix = f" ({idx}/{len(message_chunks)})" if len(message_chunks) > 1 else ""
+                    print(f"✅ 成功推送到 ID: {chat_id}{suffix}")
+                else:
+                    print(f"❌ 推送失败 ID: {chat_id}, 错误详情: {response.text}")
+            except Exception as e:
+                print(f"⚠️ TG 发送异常 (ID: {chat_id}): {e}")
+            finally:
+                time.sleep(4)  # 防止触发 TG API 发送频率限制
 
 
 def send_message_async(text: str, targets: list, parse_mode: str = None):

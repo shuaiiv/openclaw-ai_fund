@@ -29,6 +29,7 @@ from shared_utils import (
     call_ai_with_retry,
     # AI 元数据格式化
     format_ai_meta_footer,
+    format_json_for_tg,
     resolve_ai_model_name,
 )
 
@@ -725,9 +726,7 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
         with open(PLAN_FILE, "r", encoding="utf-8") as f:
             final_plan = json.load(f)
         # 只推送当前 symbol 的最新网格，避免把全部标的都塞进消息
-        canonical_json_str = json.dumps(
-            {symbol: final_plan[symbol]}, ensure_ascii=False, indent=2
-        )
+        canonical_json_str = format_json_for_tg({symbol: final_plan[symbol]})
         # 将 ai_reply 中的原始 JSON 块整体替换为落盘后的权威数据
         tg_reply = re.sub(
             r'```json\s*.*?\s*```',
@@ -817,9 +816,7 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
         with open(PLAN_FILE, "r", encoding="utf-8") as f:
             final_plan = json.load(f)
         if symbol in final_plan:
-            canonical_json_str = json.dumps(
-                {symbol: final_plan[symbol]}, ensure_ascii=False, indent=2
-            )
+            canonical_json_str = format_json_for_tg({symbol: final_plan[symbol]})
             tg_reply = re.sub(
                 r'```json\s*.*?\s*```',
                 f'```json\n{canonical_json_str}\n```',

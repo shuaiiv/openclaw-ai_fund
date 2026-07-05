@@ -35,6 +35,7 @@ from shared_utils import (
     call_ai_with_retry,
     # AI 元数据格式化
     format_ai_meta_footer,
+    format_json_for_tg,
     resolve_ai_model_name,
 )
 
@@ -711,9 +712,7 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
             print(f"✅ {symbol} 网格已更新到 daily_trading_plan.json")
 
             # 用准确的 JSON 替换 ai_reply 中的原始 JSON 代码块
-            canonical_json = json.dumps(
-                {symbol: plan.get(symbol, {})}, ensure_ascii=False, indent=2
-            )
+            canonical_json = format_json_for_tg({symbol: plan.get(symbol, {})})
             ai_reply = re.sub(
                 r'```json\s*.*?\s*```',
                 f'```json\n{canonical_json}\n```',
@@ -733,18 +732,7 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
     # 2. 推送 AI 分析报告
     prefix = f"💭 **盘前策略报告** ┃ **{symbol}**\n━━━━━━━━━━━━━━━━━━━━━\n"
     full_content = ai_reply + meta_footer
-    max_safe = 4000  # 内容最大字符数（含前缀不超过 4096）
-    if len(prefix) + len(full_content) <= max_safe:
-        tg_send(prefix + full_content)
-    else:
-        # 分段发送，每次确保 prefix + chunk 不超过 max_safe
-        chunk_size = max_safe - len(prefix)
-        # 元数据尾注附加在最后一段
-        chunks = [ai_reply[i:i+chunk_size] for i in range(0, len(ai_reply), chunk_size)]
-        for i, chunk in enumerate(chunks):
-            header = prefix if i == 0 else f"💭 **盘前策略报告** ┃ **{symbol}** (续 {i+1})\n━━━━━━━━━━━━━━━━━━━━━\n"
-            content = chunk + (meta_footer if i == len(chunks) - 1 else "")
-            tg_send(header + content)
+    tg_send(prefix + full_content)
 
 
 # ==========================================

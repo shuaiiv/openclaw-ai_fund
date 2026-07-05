@@ -105,6 +105,19 @@ def save_plan(plan: dict):
         json.dump(plan, f, ensure_ascii=False, indent=4)
 
 
+def format_json_for_tg(data, pretty_limit: int = 2800) -> str:
+    """
+    生成适合 Telegram 单条消息展示的 JSON。
+
+    优先保留缩进可读性；当缩进版过长时，改用紧凑格式，尽量确保
+    ```json ... ``` 代码块能作为一个整体留在同一条 TG 消息中。
+    """
+    pretty = json.dumps(data, ensure_ascii=False, indent=2)
+    if len(pretty) <= pretty_limit:
+        return pretty
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+
 # ==========================================================
 # 🔄 标的代码转换
 # ==========================================================
