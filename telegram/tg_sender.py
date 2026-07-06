@@ -272,8 +272,8 @@ def _format_and_split_html(text: str, max_html_len: int, max_text_len: int = 500
             if following_raw:
                 tail_block = f"{block}\n\n{_render_text_html(following_raw, collapse_text)}"
                 if len(tail_block) <= max_html_len:
-                    # JSON 通常位于报告末尾；优先把 JSON + meta footer 作为一条消息。
-                    flush()
+                    # JSON 通常位于报告末尾；优先绑定 JSON + meta footer。
+                    # 但只有当前消息放不下时，append_block 才会切到下一条。
                     append_block(tail_block)
                     i += 2
                     continue
