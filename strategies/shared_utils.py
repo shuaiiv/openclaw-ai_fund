@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import requests
+import uuid
 from datetime import datetime, timedelta
 from dotenv import load_dotenv, find_dotenv
 
@@ -40,6 +41,7 @@ load_dotenv(find_dotenv(), override=True)
 # ==========================================================
 PLAN_FILE = os.path.join(ROOT_DIR, "data", "daily_trading_plan.json")
 CACHE_DIR = os.path.join(ROOT_DIR, "data", "cache")
+AI_LOG_DIR = os.path.join(ROOT_DIR, "log_view", "ai_logs")
 
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 
@@ -103,6 +105,54 @@ def save_plan(plan: dict):
     os.makedirs(os.path.dirname(PLAN_FILE), exist_ok=True)
     with open(PLAN_FILE, "w", encoding="utf-8") as f:
         json.dump(plan, f, ensure_ascii=False, indent=4)
+
+
+def infer_market_from_symbol(symbol: str) -> str:
+    """从长桥格式标的代码推断市场。"""
+    upper = (symbol or "").upper()
+    if upper.endswith(".HK"):
+        return "HK"
+    if upper.endswith(".US"):
+        return "US"
+    return ""
+
+
+def append_ai_audit_log(entry: dict) -> str:
+    """
+    将 AI 输入/输出审计日志追加到 log_view/ai_logs/ai_audit_YYYY-MM-DD.jsonl。
+
+    日志按 JSONL 追加，方便页面流式读取，也避免影响现有交易计划 JSON。
+    返回本次记录 id；写入失败时只打印错误，不中断策略主流程。
+    """
+    now = datetime.now().astimezone()
+    log_id = entry.get("id") or f"{now.strftime('%Y%m%d%H%M%S')}-{uuid.uuid4().hex[:8]}"
+    symbol = entry.get("symbol", "")
+    record = {
+        "id": log_id,
+        "created_at": entry.get("created_at") or now.isoformat(timespec="seconds"),
+        "date": entry.get("date") or now.strftime("%Y-%m-%d"),
+        "strategy": entry.get("strategy", ""),
+        "event_type": entry.get("event_type", ""),
+        "market": entry.get("market") or infer_market_from_symbol(symbol),
+        "symbol": symbol,
+        "title": entry.get("title", ""),
+        "trigger": entry.get("trigger", {}),
+        "ai_input": entry.get("ai_input", ""),
+        "ai_output": entry.get("ai_output", ""),
+        "tg_message": entry.get("tg_message", ""),
+        "metadata": entry.get("metadata") or {},
+        "error": entry.get("error", ""),
+    }
+
+    try:
+        os.makedirs(AI_LOG_DIR, exist_ok=True)
+        log_path = os.path.join(AI_LOG_DIR, f"ai_audit_{record['date']}.jsonl")
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception as e:
+        print(f"⚠️ AI 审计日志写入失败: {e}")
+
+    return log_id
 
 
 def format_json_for_tg(data, pretty_limit: int = 2800) -> str:

@@ -31,6 +31,7 @@ from shared_utils import (
     format_ai_meta_footer,
     format_json_for_tg,
     resolve_ai_model_name,
+    append_ai_audit_log,
 )
 
 # ==========================================
@@ -645,7 +646,7 @@ def call_ai(wake_msg: str, sys_prompt: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
-def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0, metadata: dict | None = None):
+def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0, metadata: dict | None = None) -> str:
     """
     解析【网格触线裁决】的 AI 回复：
     1. 正则提取 [ACTION:...] 指令并执行下单
@@ -766,10 +767,12 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
     if meta_footer:
         tg_parts.append(meta_footer)
 
-    tg_analysis("\n".join(tg_parts))
+    tg_message = "\n".join(tg_parts)
+    tg_analysis(tg_message)
+    return tg_message
 
 
-def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = None):
+def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = None) -> str:
     """
     解析【订单状态变更重构】的 AI 回复：
     1. 提取 ```json...``` 全面吸收为新网格（不解析 ACTION 指令）
@@ -829,12 +832,14 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
     # 构建 AI 元数据尾注
     meta_footer = format_ai_meta_footer(ai_model_name, metadata)
 
-    tg_analysis(
+    tg_message = (
         f"📐 **网格重构完成** ┃ **{symbol}**\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
         f"{tg_reply}"
         f"{meta_footer}"
     )
+    tg_analysis(tg_message)
+    return tg_message
 
 
 # ===========================================================================
@@ -882,7 +887,38 @@ def process_grid_trigger(symbol: str, data: dict, current_price: float, zone_nam
     # 5. 调用 AI 并处理裁决
     ai_reply, ai_metadata = call_ai(wake_msg, INTRADAY_SENTRY_PROMPT)
     if ai_reply:
-        handle_ai_verdict(symbol, ai_reply, zone_name=zone_name, current_price=current_price, metadata=ai_metadata)
+        tg_message = handle_ai_verdict(symbol, ai_reply, zone_name=zone_name, current_price=current_price, metadata=ai_metadata)
+        append_ai_audit_log({
+            "strategy": "intraday_sentry",
+            "event_type": "grid_trigger",
+            "symbol": symbol,
+            "title": f"盘中网格裁决 | {symbol} | {zone_name}",
+            "trigger": {
+                "zone_name": zone_name,
+                "trigger_price": trigger_price,
+                "current_price": current_price,
+                "zone_info": zone_info,
+            },
+            "ai_input": wake_msg,
+            "ai_output": ai_reply,
+            "tg_message": tg_message,
+            "metadata": ai_metadata,
+        })
+    else:
+        append_ai_audit_log({
+            "strategy": "intraday_sentry",
+            "event_type": "grid_trigger",
+            "symbol": symbol,
+            "title": f"盘中网格裁决失败 | {symbol} | {zone_name}",
+            "trigger": {
+                "zone_name": zone_name,
+                "trigger_price": trigger_price,
+                "current_price": current_price,
+                "zone_info": zone_info,
+            },
+            "ai_input": wake_msg,
+            "error": "盘中哨兵 AI 无响应",
+        })
 
     # 防洪闸：处理完一只雷区股票强制冷却 60 秒
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 哨兵进入 60 秒战术冷却...")
@@ -918,7 +954,34 @@ def process_order_event(symbol: str, data: dict, current_price: float, special_e
     # 4. 调用 AI 并处理重构结果（不发 L5 通知，不解析 ACTION）
     ai_reply, ai_metadata = call_ai(wake_msg, INTRADAY_REBUILD_PROMPT)
     if ai_reply:
-        handle_rebuild_result(symbol, ai_reply, metadata=ai_metadata)
+        tg_message = handle_rebuild_result(symbol, ai_reply, metadata=ai_metadata)
+        append_ai_audit_log({
+            "strategy": "intraday_sentry",
+            "event_type": "order_rebuild",
+            "symbol": symbol,
+            "title": f"订单事件网格重构 | {symbol}",
+            "trigger": {
+                "current_price": current_price,
+                "special_event_msg": special_event_msg,
+            },
+            "ai_input": wake_msg,
+            "ai_output": ai_reply,
+            "tg_message": tg_message,
+            "metadata": ai_metadata,
+        })
+    else:
+        append_ai_audit_log({
+            "strategy": "intraday_sentry",
+            "event_type": "order_rebuild",
+            "symbol": symbol,
+            "title": f"订单事件网格重构失败 | {symbol}",
+            "trigger": {
+                "current_price": current_price,
+                "special_event_msg": special_event_msg,
+            },
+            "ai_input": wake_msg,
+            "error": "订单事件重构 AI 无响应",
+        })
 
     # 防洪闸
     print(f"[{datetime.now().strftime('%H:%M:%S')}] ⏳ 哨兵进入 60 秒战术冷却...")

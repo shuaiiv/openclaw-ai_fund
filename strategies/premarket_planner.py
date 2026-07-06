@@ -37,6 +37,7 @@ from shared_utils import (
     format_ai_meta_footer,
     format_json_for_tg,
     resolve_ai_model_name,
+    append_ai_audit_log,
 )
 
 # ==========================================
@@ -679,7 +680,7 @@ def call_ai(wake_msg: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
-def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
+def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None) -> str:
     """
     解析 AI 回复：
     1. 提取 ```json...``` 更新 daily_trading_plan.json
@@ -732,7 +733,9 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None):
     # 2. 推送 AI 分析报告
     prefix = f"💭 **盘前策略报告** ┃ **{symbol}**\n━━━━━━━━━━━━━━━━━━━━━\n"
     full_content = ai_reply + meta_footer
-    tg_send(prefix + full_content)
+    tg_message = prefix + full_content
+    tg_send(tg_message)
+    return tg_message
 
 
 # ==========================================
@@ -834,9 +837,39 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
         ai_reply, ai_metadata = call_ai(wake_msg)
 
         if ai_reply:
-            handle_ai_result(symbol, ai_reply, metadata=ai_metadata)
+            tg_message = handle_ai_result(symbol, ai_reply, metadata=ai_metadata)
+            append_ai_audit_log({
+                "strategy": "premarket_planner",
+                "event_type": "premarket_plan",
+                "market": market,
+                "symbol": symbol,
+                "title": f"盘前策略报告 | {symbol}",
+                "trigger": {
+                    "market_name": market_name,
+                    "current_price": current_price,
+                    "price_session": price_result.get("session", "") if current_price > 0 else "",
+                },
+                "ai_input": wake_msg,
+                "ai_output": ai_reply,
+                "tg_message": tg_message,
+                "metadata": ai_metadata,
+            })
         else:
             tg_send(f"❌ {symbol} 盘前谋划 AI 无响应")
+            append_ai_audit_log({
+                "strategy": "premarket_planner",
+                "event_type": "premarket_plan",
+                "market": market,
+                "symbol": symbol,
+                "title": f"盘前策略报告失败 | {symbol}",
+                "trigger": {
+                    "market_name": market_name,
+                    "current_price": current_price,
+                    "price_session": price_result.get("session", "") if current_price > 0 else "",
+                },
+                "ai_input": wake_msg,
+                "error": "盘前谋划 AI 无响应",
+            })
 
         print(f"  ✅ {symbol} 分析完成")
 

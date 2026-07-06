@@ -10,6 +10,8 @@
 
 - **`data/cache/`**: 本地行情数据缓存目录，由 `shared_utils.py` / `stockscope/fetch.py` 统一管理（`read_cache` / `write_cache`），用于减少外部 API（长桥/富途）的重复调用频率。缓存项包括标的静态信息（永久缓存）、估值指标（当日缓存）、日K线（增量缓存）、分钟K线（当日缓存）以及盘前数据快照（`premarket_memo_*.json`）。
 - **`data/daily_trading_plan.json`**: 整个交易系统运行的核心状态文件。此文件由盘前策略（Premarket Planner）通过 AI 分析生成，记录了各标的的操作网格（触发价、操作方向、冷却时间等），供日内哨兵（Intraday Sentry）实时读取和更新。字段包括 `status`, `macro_thesis`, `update_time`, `zones`（多级网格：`stop_loss`, `take_profit`, `buy_dip`, `buy_breakout`, `add_position`, `buy_oversold`）、`cooldown_until`（战术冷却时间戳）和 `pending_order`（挂单锁，含 `id` 和 `time`）。
+- **`log_view/ai_logs/`**: AI 审计日志目录。`premarket_planner.py` 与 `intraday_sentry.py` 会按日追加 `ai_audit_YYYY-MM-DD.jsonl`，记录喂给模型的数据、模型原始回复、最终推送到 TG Analysis 的内容、触发信息和模型元数据。
+- **`log_view/log_viewer.py`**: 本地 AI 日志查看页面。启动命令：`python for_openclaw/log_view/log_viewer.py --host 127.0.0.1 --port 8766`，打开 `http://127.0.0.1:8766` 后可按日期、港股/美股、标的 Code、事件类型筛选。
 
 ### 2. 券商集成底层 SDK
 
