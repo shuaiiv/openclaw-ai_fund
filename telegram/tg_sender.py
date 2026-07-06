@@ -2,6 +2,7 @@ import os
 import re
 import time
 import threading
+import queue
 import requests
 from dotenv import load_dotenv
 
@@ -72,6 +73,9 @@ def _render_markdown(text: str) -> str:
 _CODE_BLOCK_RE = re.compile(r'(```(\w*)\s*\n?(.*?)\s*```)', re.DOTALL)
 _TG_MAX_MESSAGE_CHARS = 4096
 _TG_SAFE_MARGIN_CHARS = 32
+_send_queue = queue.Queue()
+_send_worker_lock = threading.Lock()
+_send_worker_started = False
 
 
 def _parse_markdown_parts(text: str) -> list:
@@ -248,17 +252,32 @@ def _format_and_split_html(text: str, max_html_len: int, max_text_len: int = 500
         current.append(block)
         current_len += sep_len + len(block)
 
-    for part in parts:
+    i = 0
+    while i < len(parts):
+        part = parts[i]
         if part[0] == 'text':
             raw = part[1].strip()
             if not raw:
+                i += 1
                 continue
             for block in _split_text_html(raw, max_html_len, collapse_text):
                 append_block(block)
+            i += 1
             continue
 
         _, lang, content = part
         block = _render_code_html(lang, content)
+        if lang == 'json' and i + 1 < len(parts) and parts[i + 1][0] == 'text':
+            following_raw = parts[i + 1][1].strip()
+            if following_raw:
+                tail_block = f"{block}\n\n{_render_text_html(following_raw, collapse_text)}"
+                if len(tail_block) <= max_html_len:
+                    # JSON 通常位于报告末尾；优先把 JSON + meta footer 作为一条消息。
+                    flush()
+                    append_block(tail_block)
+                    i += 2
+                    continue
+
         if len(block) <= max_html_len:
             append_block(block)
         else:
@@ -267,6 +286,7 @@ def _format_and_split_html(text: str, max_html_len: int, max_text_len: int = 500
             for code_block in _split_oversized_code_html(lang, content, max_html_len):
                 append_block(code_block)
                 flush()
+        i += 1
 
     flush()
     return chunks or [""]
@@ -326,8 +346,30 @@ def _sync_tg_send(text: str, targets: list, parse_mode: str = None):
                 time.sleep(4)  # 防止触发 TG API 发送频率限制
 
 
+def _tg_send_worker():
+    while True:
+        text, targets, parse_mode = _send_queue.get()
+        try:
+            _sync_tg_send(text, targets, parse_mode)
+        except Exception as e:
+            print(f"⚠️ TG 队列发送异常: {e}")
+        finally:
+            _send_queue.task_done()
+
+
+def _ensure_send_worker():
+    global _send_worker_started
+    if _send_worker_started:
+        return
+    with _send_worker_lock:
+        if _send_worker_started:
+            return
+        t = threading.Thread(target=_tg_send_worker, daemon=True)
+        t.start()
+        _send_worker_started = True
+
+
 def send_message_async(text: str, targets: list, parse_mode: str = None):
-    """发送 Telegram 消息 (后台线程免阻塞)"""
-    t = threading.Thread(target=_sync_tg_send, args=(text, targets, parse_mode))
-    t.daemon = True
-    t.start()
+    """发送 Telegram 消息 (后台队列免阻塞，并保持调用顺序)"""
+    _ensure_send_worker()
+    _send_queue.put((text, targets, parse_mode))
