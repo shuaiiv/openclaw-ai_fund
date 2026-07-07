@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import argparse
 import json
-from datetime import date
+import re
+from datetime import date, datetime
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -30,6 +31,8 @@ STRATEGY_LABELS = {
     "premarket_planner": "Premarket Planner",
     "intraday_sentry": "Intraday Sentry",
 }
+
+ACTION_RE = re.compile(r"\[ACTION:\s*(BUY|SELL|HOLD)\b", re.IGNORECASE)
 
 
 HTML = r"""<!doctype html>
@@ -93,7 +96,7 @@ HTML = r"""<!doctype html>
 
     .filters {
       display: grid;
-      grid-template-columns: 160px 130px minmax(160px, 1fr) 150px 112px;
+      grid-template-columns: 150px 150px 130px minmax(180px, 1fr) 150px 112px;
       gap: 10px;
       padding: 14px 20px;
       background: var(--panel-soft);
@@ -223,8 +226,14 @@ HTML = r"""<!doctype html>
       white-space: nowrap;
     }
 
-    .pill.hk { color: #8a4b00; border-color: #dfc89c; background: #fff7e8; }
-    .pill.us { color: #0c5f49; border-color: #a9d7c2; background: #ecf8f2; }
+    .pill.hk { color: #9f3328; border-color: #ebb2aa; background: #fff0ee; }
+    .pill.us { color: #28558a; border-color: #a8c7e8; background: #edf5ff; }
+    .pill.event-premarket { color: #6b3a83; border-color: #d5b7e2; background: #f7edf9; }
+    .pill.event-grid { color: #9c3268; border-color: #e6adc9; background: #fff0f6; }
+    .pill.event-rebuild { color: #28558a; border-color: #a8c7e8; background: #edf5ff; }
+    .pill.action-buy { color: #a43422; border-color: #eda79d; background: #fff0ed; }
+    .pill.action-sell { color: #0a684f; border-color: #7acaa6; background: #e7f8ef; }
+    .pill.action-hold { color: #28558a; border-color: #a8c7e8; background: #edf5ff; }
     .pill.error { color: var(--danger); border-color: #f0b8b3; background: #fff0ee; }
 
     .tabs {
@@ -260,7 +269,7 @@ HTML = r"""<!doctype html>
 
     .summary {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 10px;
       margin-bottom: 12px;
     }
@@ -323,8 +332,11 @@ HTML = r"""<!doctype html>
   </header>
 
   <form class="filters" id="filters">
-    <label>日期
-      <input type="date" name="date" id="date">
+    <label>开始日期
+      <input type="date" name="start_date" id="start_date">
+    </label>
+    <label>结束日期
+      <input type="date" name="end_date" id="end_date">
     </label>
     <label>市场
       <select name="market" id="market">
@@ -396,7 +408,9 @@ HTML = r"""<!doctype html>
 
     function setInitialFilters() {
       const params = new URLSearchParams(location.search);
-      $("date").value = params.get("date") || today();
+      const legacyDate = params.get("date");
+      $("start_date").value = params.get("start_date") || legacyDate || today();
+      $("end_date").value = params.get("end_date") || legacyDate || today();
       $("market").value = params.get("market") || "";
       $("symbol").value = params.get("symbol") || "";
       $("event_type").value = params.get("event_type") || "";
@@ -404,7 +418,7 @@ HTML = r"""<!doctype html>
 
     function buildParams() {
       const params = new URLSearchParams();
-      for (const key of ["date", "market", "symbol", "event_type"]) {
+      for (const key of ["start_date", "end_date", "market", "symbol", "event_type"]) {
         const value = $(key).value.trim();
         if (value) params.set(key, value);
       }
@@ -452,7 +466,7 @@ HTML = r"""<!doctype html>
         const title = document.createElement("div");
         title.className = "item-title";
         const titleText = document.createElement("span");
-        titleText.textContent = rec.title || `${rec.symbol} ${eventLabels[rec.event_type] || rec.event_type}`;
+        titleText.textContent = displayTitle(rec);
         const time = document.createElement("span");
         time.className = "pill";
         time.textContent = (rec.created_at || "").replace("T", " ").slice(11, 19);
@@ -460,9 +474,12 @@ HTML = r"""<!doctype html>
 
         const meta = document.createElement("div");
         meta.className = "meta";
-        meta.append(pill(rec.market || "-", (rec.market || "").toLowerCase()));
+        meta.append(pill(marketLabel(rec.market), (rec.market || "").toLowerCase()));
         meta.append(pill(rec.symbol || "-"));
-        meta.append(pill(eventLabels[rec.event_type] || rec.event_type || "-"));
+        meta.append(pill(eventLabels[rec.event_type] || rec.event_type || "-", eventClass(rec.event_type)));
+        if (rec.event_type === "grid_trigger" && rec.action) {
+          meta.append(pill(actionLabel(rec.action), actionClass(rec.action)));
+        }
         if (rec.error) meta.append(pill("失败", "error"));
 
         item.append(title, meta);
@@ -475,6 +492,40 @@ HTML = r"""<!doctype html>
       el.className = `pill ${extra}`;
       el.textContent = text;
       return el;
+    }
+
+    function eventClass(eventType) {
+      if (eventType === "premarket_plan") return "event-premarket";
+      if (eventType === "grid_trigger") return "event-grid";
+      if (eventType === "order_rebuild") return "event-rebuild";
+      return "";
+    }
+
+    function actionClass(action) {
+      const normalized = String(action || "").toLowerCase();
+      if (normalized === "buy") return "action-buy";
+      if (normalized === "sell") return "action-sell";
+      if (normalized === "hold") return "action-hold";
+      return "";
+    }
+
+    function actionLabel(action) {
+      return `ACTION: ${String(action || "").toUpperCase()}`;
+    }
+
+    function displayTitle(rec) {
+      const base = rec.title || `${rec.symbol} ${eventLabels[rec.event_type] || rec.event_type}`;
+      if (rec.event_type !== "grid_trigger" || !rec.action || base.includes("ACTION:")) {
+        return base;
+      }
+      return `${base} | ${actionLabel(rec.action)}`;
+    }
+
+    function marketLabel(market) {
+      const normalized = String(market || "").toUpperCase();
+      if (normalized === "HK") return "🇭🇰";
+      if (normalized === "US") return "🇺🇸";
+      return market || "-";
     }
 
     function renderDetail() {
@@ -490,7 +541,7 @@ HTML = r"""<!doctype html>
         return;
       }
 
-      $("detail-title").textContent = rec.title || rec.symbol || "详情";
+      $("detail-title").textContent = displayTitle(rec) || rec.symbol || "详情";
       for (const key of Object.keys(tabLabels)) {
         const btn = document.createElement("button");
         btn.type = "button";
@@ -506,9 +557,9 @@ HTML = r"""<!doctype html>
       const summary = document.createElement("div");
       summary.className = "summary";
       summary.append(metric("时间", (rec.created_at || "").replace("T", " ")));
-      summary.append(metric("市场", rec.market || "-"));
+      summary.append(metric("市场", marketLabel(rec.market)));
       summary.append(metric("标的", rec.symbol || "-"));
-      summary.append(metric("类型", eventLabels[rec.event_type] || rec.event_type || "-"));
+      summary.append(metric("类型", detailTypeLabel(rec)));
       detail.appendChild(summary);
 
       if (rec.error) {
@@ -527,15 +578,23 @@ HTML = r"""<!doctype html>
       detail.appendChild(pre);
     }
 
-    function metric(label, value) {
+    function metric(label, value, extraClass = "") {
       const el = document.createElement("div");
-      el.className = "metric";
+      el.className = `metric ${extraClass}`;
       const span = document.createElement("span");
       span.textContent = label;
       const strong = document.createElement("strong");
       strong.textContent = value || "-";
       el.append(span, strong);
       return el;
+    }
+
+    function detailTypeLabel(rec) {
+      const base = eventLabels[rec.event_type] || rec.event_type || "-";
+      if (rec.event_type === "grid_trigger" && rec.action) {
+        return `${base} | ${actionLabel(rec.action)}`;
+      }
+      return base;
     }
 
     $("filters").addEventListener("submit", (event) => {
@@ -573,21 +632,85 @@ def _html_response(handler: BaseHTTPRequestHandler) -> None:
     handler.wfile.write(body)
 
 
-def _available_files(log_date: str) -> list[Path]:
-    if log_date:
-        path = LOG_DIR / f"ai_audit_{log_date}.jsonl"
-        return [path] if path.exists() else []
-    return sorted(LOG_DIR.glob("ai_audit_*.jsonl"), reverse=True)
+def _parse_iso_date(value: str) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _date_from_log_path(path: Path) -> date | None:
+    prefix = "ai_audit_"
+    suffix = ".jsonl"
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    return _parse_iso_date(name[len(prefix):-len(suffix)])
+
+
+def _available_files(start_date: str, end_date: str, legacy_date: str = "") -> list[Path]:
+    if legacy_date and not start_date and not end_date:
+        start_date = end_date = legacy_date
+
+    start = _parse_iso_date(start_date)
+    end = _parse_iso_date(end_date)
+    if start and not end:
+        end = start
+    if end and not start:
+        start = end
+    if start and end and start > end:
+        start, end = end, start
+
+    paths = sorted(LOG_DIR.glob("ai_audit_*.jsonl"), reverse=True)
+    if not start and not end:
+        return paths
+
+    selected: list[Path] = []
+    for path in paths:
+        log_day = _date_from_log_path(path)
+        if not log_day:
+            continue
+        if start and log_day < start:
+            continue
+        if end and log_day > end:
+            continue
+        selected.append(path)
+    return selected
+
+
+def _extract_action(rec: dict) -> str:
+    if rec.get("event_type") != "grid_trigger":
+        return ""
+
+    search_text = "\n".join(
+        str(rec.get(key, "")) for key in ("ai_output", "tg_message")
+    )
+    match = ACTION_RE.search(search_text)
+    if match:
+        return match.group(1).upper()
+
+    tg_message = str(rec.get("tg_message", ""))
+    if "买入裁决" in tg_message:
+        return "BUY"
+    if "卖出裁决" in tg_message:
+        return "SELL"
+    if "观望裁决" in tg_message:
+        return "HOLD"
+    return ""
 
 
 def _load_records(query: dict[str, list[str]]) -> list[dict]:
-    log_date = _first(query, "date")
+    start_date = _first(query, "start_date")
+    end_date = _first(query, "end_date")
+    legacy_date = _first(query, "date")
     market = _first(query, "market").upper()
     symbol = _first(query, "symbol").upper()
     event_type = _first(query, "event_type")
 
     records: list[dict] = []
-    for path in _available_files(log_date):
+    for path in _available_files(start_date, end_date, legacy_date):
         with path.open("r", encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
@@ -608,6 +731,7 @@ def _load_records(query: dict[str, list[str]]) -> list[dict]:
 
                 rec["event_label"] = EVENT_LABELS.get(rec.get("event_type"), rec.get("event_type", ""))
                 rec["strategy_label"] = STRATEGY_LABELS.get(rec.get("strategy"), rec.get("strategy", ""))
+                rec["action"] = _extract_action(rec)
                 records.append(rec)
 
     records.sort(key=lambda item: item.get("created_at", ""), reverse=True)
