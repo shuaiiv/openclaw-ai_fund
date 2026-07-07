@@ -680,7 +680,7 @@ def call_ai(wake_msg: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
-def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None) -> str:
+def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None) -> dict:
     """
     解析 AI 回复：
     1. 提取 ```json...``` 更新 daily_trading_plan.json
@@ -688,6 +688,7 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None) -
     """
     # 1. 提取并更新 JSON
     ai_model_name = None  # 从 AI 输出的 JSON 中提取模型名 → 用 metadata 修正
+    canonical_json_data = None
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -713,7 +714,8 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None) -
             print(f"✅ {symbol} 网格已更新到 daily_trading_plan.json")
 
             # 用准确的 JSON 替换 ai_reply 中的原始 JSON 代码块
-            canonical_json = format_json_for_tg({symbol: plan.get(symbol, {})})
+            canonical_json_data = {symbol: plan.get(symbol, {})}
+            canonical_json = format_json_for_tg(canonical_json_data)
             ai_reply = re.sub(
                 r'```json\s*.*?\s*```',
                 f'```json\n{canonical_json}\n```',
@@ -735,7 +737,11 @@ def handle_ai_result(symbol: str, ai_reply: str, metadata: dict | None = None) -
     full_content = ai_reply + meta_footer
     tg_message = prefix + full_content
     tg_send(tg_message)
-    return tg_message
+    return {
+        "tg_message": tg_message,
+        "canonical_json": canonical_json_data,
+        "ai_model_name": ai_model_name,
+    }
 
 
 # ==========================================
@@ -837,7 +843,7 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
         ai_reply, ai_metadata = call_ai(wake_msg)
 
         if ai_reply:
-            tg_message = handle_ai_result(symbol, ai_reply, metadata=ai_metadata)
+            audit_result = handle_ai_result(symbol, ai_reply, metadata=ai_metadata)
             append_ai_audit_log({
                 "strategy": "premarket_planner",
                 "event_type": "premarket_plan",
@@ -851,7 +857,7 @@ def process_single_symbol(symbol: str, market: str, market_name: str):
                 },
                 "ai_input": wake_msg,
                 "ai_output": ai_reply,
-                "tg_message": tg_message,
+                "canonical_json": audit_result.get("canonical_json"),
                 "metadata": ai_metadata,
             })
         else:

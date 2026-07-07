@@ -646,7 +646,7 @@ def call_ai(wake_msg: str, sys_prompt: str) -> tuple[str | None, dict | None]:
     return None, None
 
 
-def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0, metadata: dict | None = None) -> str:
+def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_price: float = 0.0, metadata: dict | None = None) -> dict:
     """
     解析【网格触线裁决】的 AI 回复：
     1. 正则提取 [ACTION:...] 指令并执行下单
@@ -655,6 +655,7 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
     """
     # 用于捕获真实的订单ID
     generated_order_id = None
+    canonical_json_data = None
 
     # 1. 解析行动指令
     action_match = re.search(
@@ -727,7 +728,8 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
         with open(PLAN_FILE, "r", encoding="utf-8") as f:
             final_plan = json.load(f)
         # 只推送当前 symbol 的最新网格，避免把全部标的都塞进消息
-        canonical_json_str = format_json_for_tg({symbol: final_plan[symbol]})
+        canonical_json_data = {symbol: final_plan[symbol]}
+        canonical_json_str = format_json_for_tg(canonical_json_data)
         # 将 ai_reply 中的原始 JSON 块整体替换为落盘后的权威数据
         tg_reply = re.sub(
             r'```json\s*.*?\s*```',
@@ -769,10 +771,15 @@ def handle_ai_verdict(symbol: str, ai_reply: str, zone_name: str = "", current_p
 
     tg_message = "\n".join(tg_parts)
     tg_analysis(tg_message)
-    return tg_message
+    return {
+        "tg_message": tg_message,
+        "canonical_json": canonical_json_data,
+        "action": action_match.group(1) if action_match else "",
+        "reason": reason_str,
+    }
 
 
-def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = None) -> str:
+def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = None) -> dict:
     """
     解析【订单状态变更重构】的 AI 回复：
     1. 提取 ```json...``` 全面吸收为新网格（不解析 ACTION 指令）
@@ -780,6 +787,7 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
     """
     # 1. 更新本地网格文件（全面吸收 AI 新网格）
     ai_model_name = None  # 从 AI 输出的 JSON 中提取模型名 → 用 metadata 修正
+    canonical_json_data = None
     json_match = re.search(r'```json\s*(.*?)\s*```', ai_reply, re.DOTALL)
     if json_match:
         try:
@@ -819,7 +827,8 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
         with open(PLAN_FILE, "r", encoding="utf-8") as f:
             final_plan = json.load(f)
         if symbol in final_plan:
-            canonical_json_str = format_json_for_tg({symbol: final_plan[symbol]})
+            canonical_json_data = {symbol: final_plan[symbol]}
+            canonical_json_str = format_json_for_tg(canonical_json_data)
             tg_reply = re.sub(
                 r'```json\s*.*?\s*```',
                 f'```json\n{canonical_json_str}\n```',
@@ -839,7 +848,10 @@ def handle_rebuild_result(symbol: str, ai_reply: str, metadata: dict | None = No
         f"{meta_footer}"
     )
     tg_analysis(tg_message)
-    return tg_message
+    return {
+        "tg_message": tg_message,
+        "canonical_json": canonical_json_data,
+    }
 
 
 # ===========================================================================
@@ -887,7 +899,7 @@ def process_grid_trigger(symbol: str, data: dict, current_price: float, zone_nam
     # 5. 调用 AI 并处理裁决
     ai_reply, ai_metadata = call_ai(wake_msg, INTRADAY_SENTRY_PROMPT)
     if ai_reply:
-        tg_message = handle_ai_verdict(symbol, ai_reply, zone_name=zone_name, current_price=current_price, metadata=ai_metadata)
+        audit_result = handle_ai_verdict(symbol, ai_reply, zone_name=zone_name, current_price=current_price, metadata=ai_metadata)
         append_ai_audit_log({
             "strategy": "intraday_sentry",
             "event_type": "grid_trigger",
@@ -901,7 +913,8 @@ def process_grid_trigger(symbol: str, data: dict, current_price: float, zone_nam
             },
             "ai_input": wake_msg,
             "ai_output": ai_reply,
-            "tg_message": tg_message,
+            "canonical_json": audit_result.get("canonical_json"),
+            "action": audit_result.get("action", ""),
             "metadata": ai_metadata,
         })
     else:
@@ -954,7 +967,7 @@ def process_order_event(symbol: str, data: dict, current_price: float, special_e
     # 4. 调用 AI 并处理重构结果（不发 L5 通知，不解析 ACTION）
     ai_reply, ai_metadata = call_ai(wake_msg, INTRADAY_REBUILD_PROMPT)
     if ai_reply:
-        tg_message = handle_rebuild_result(symbol, ai_reply, metadata=ai_metadata)
+        audit_result = handle_rebuild_result(symbol, ai_reply, metadata=ai_metadata)
         append_ai_audit_log({
             "strategy": "intraday_sentry",
             "event_type": "order_rebuild",
@@ -966,7 +979,7 @@ def process_order_event(symbol: str, data: dict, current_price: float, special_e
             },
             "ai_input": wake_msg,
             "ai_output": ai_reply,
-            "tg_message": tg_message,
+            "canonical_json": audit_result.get("canonical_json"),
             "metadata": ai_metadata,
         })
     else:

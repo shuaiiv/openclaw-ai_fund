@@ -139,10 +139,13 @@ def append_ai_audit_log(entry: dict) -> str:
         "trigger": entry.get("trigger", {}),
         "ai_input": entry.get("ai_input", ""),
         "ai_output": entry.get("ai_output", ""),
-        "tg_message": entry.get("tg_message", ""),
+        "canonical_json": entry.get("canonical_json"),
+        "action": entry.get("action", ""),
         "metadata": entry.get("metadata") or {},
         "error": entry.get("error", ""),
     }
+    if entry.get("store_tg_message"):
+        record["tg_message"] = entry.get("tg_message", "")
 
     try:
         os.makedirs(AI_LOG_DIR, exist_ok=True)

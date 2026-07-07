@@ -307,6 +307,73 @@ HTML = r"""<!doctype html>
       font: 12.5px/1.55 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     }
 
+    .markdown-body {
+      margin: 0;
+      padding: 16px;
+      border-radius: 8px;
+      background: var(--code-bg);
+      color: var(--code-text);
+      overflow-wrap: anywhere;
+      font-size: 14px;
+      line-height: 1.65;
+    }
+
+    .markdown-body h1,
+    .markdown-body h2,
+    .markdown-body h3,
+    .markdown-body h4 {
+      margin: 16px 0 8px;
+      color: #fff;
+      line-height: 1.3;
+      font-weight: 750;
+    }
+
+    .markdown-body h1 { font-size: 21px; }
+    .markdown-body h2 { font-size: 18px; }
+    .markdown-body h3 { font-size: 16px; }
+    .markdown-body h4 { font-size: 15px; }
+    .markdown-body p { margin: 8px 0; }
+    .markdown-body strong { color: #fff; font-weight: 800; }
+    .markdown-body hr {
+      height: 1px;
+      border: 0;
+      margin: 16px 0;
+      background: rgba(232, 237, 225, 0.24);
+    }
+
+    .markdown-body ul {
+      margin: 8px 0 10px;
+      padding-left: 22px;
+    }
+
+    .markdown-body li { margin: 4px 0; }
+
+    .markdown-body code {
+      padding: 1px 5px;
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.1);
+      color: #f5f8ef;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.94em;
+    }
+
+    .markdown-body pre {
+      margin: 12px 0;
+      padding: 12px;
+      border: 1px solid rgba(232, 237, 225, 0.16);
+      background: #0d100c;
+      color: var(--code-text);
+      overflow: auto;
+    }
+
+    .markdown-body pre code {
+      padding: 0;
+      border-radius: 0;
+      background: transparent;
+      color: inherit;
+      font-size: inherit;
+    }
+
     .empty {
       padding: 32px 16px;
       color: var(--muted);
@@ -570,12 +637,18 @@ HTML = r"""<!doctype html>
       }
 
       const pre = document.createElement("pre");
-      let value = rec[state.tab];
       if (state.tab === "trigger" || state.tab === "metadata") {
-        value = JSON.stringify(value || {}, null, 2);
+        const value = JSON.stringify(rec[state.tab] || {}, null, 2);
+        pre.textContent = value || "无内容";
+        detail.appendChild(pre);
+        return;
       }
-      pre.textContent = value || "无内容";
-      detail.appendChild(pre);
+
+      const content = document.createElement("div");
+      content.className = "markdown-body";
+      const value = contentForTab(rec, state.tab);
+      content.innerHTML = renderMarkdown(value || "无内容");
+      detail.appendChild(content);
     }
 
     function metric(label, value, extraClass = "") {
@@ -595,6 +668,195 @@ HTML = r"""<!doctype html>
         return `${base} | ${actionLabel(rec.action)}`;
       }
       return base;
+    }
+
+    function contentForTab(rec, tab) {
+      if (tab === "tg_message") {
+        return rec.tg_message || buildTgMessage(rec);
+      }
+      return rec[tab] || "";
+    }
+
+    function buildTgMessage(rec) {
+      const body = replaceJsonBlock(rec.ai_output || "", rec.canonical_json);
+      const footer = metaFooter(rec.metadata);
+      const symbol = rec.symbol || "-";
+
+      if (rec.event_type === "premarket_plan") {
+        return `💭 **盘前策略报告** ┃ **${symbol}**\n━━━━━━━━━━━━━━━━━━━━━\n${body}${footer}`;
+      }
+
+      if (rec.event_type === "grid_trigger") {
+        const trigger = rec.trigger || {};
+        const action = String(rec.action || "").toUpperCase();
+        const price = trigger.current_price ?? "-";
+        const zone = trigger.zone_name || "";
+        const reason = actionReason(rec.ai_output || "");
+        let header = `🦞 **自动裁决** ┃ **${symbol}** ┃ $${price}`;
+        if (action === "BUY") header = `🟢 **买入裁决** ┃ **${symbol}** ┃ $${price}`;
+        if (action === "SELL") header = `🔴 **卖出裁决** ┃ **${symbol}** ┃ $${price}`;
+        if (action === "HOLD") header = `⏸️ **观望裁决** ┃ **${symbol}** ┃ $${price}`;
+        if (zone) header += ` → ${zone}`;
+
+        const parts = [header, "━━━━━━━━━━━━━━━━━━━━━"];
+        if (reason) {
+          parts.push(`📊 理由: ${reason}`);
+          parts.push("━━━━━━━━━━━━━━━━━━━━━");
+        }
+        parts.push(body);
+        if (footer) parts.push(footer);
+        return parts.join("\n");
+      }
+
+      if (rec.event_type === "order_rebuild") {
+        return `📐 **网格重构完成** ┃ **${symbol}**\n━━━━━━━━━━━━━━━━━━━━━\n${body}${footer}`;
+      }
+
+      return `${body}${footer}`;
+    }
+
+    function replaceJsonBlock(text, canonicalJson) {
+      const source = String(text || "");
+      if (!canonicalJson) return source;
+      const jsonText = JSON.stringify(canonicalJson, null, 2);
+      if (/```json\s*[\s\S]*?\s*```/.test(source)) {
+        return source.replace(/```json\s*[\s\S]*?\s*```/, `\`\`\`json\n${jsonText}\n\`\`\``);
+      }
+      return `${source}\n\n\`\`\`json\n${jsonText}\n\`\`\``;
+    }
+
+    function actionReason(text) {
+      const match = String(text || "").match(/\[ACTION:\s*(?:BUY|SELL|HOLD)(?:,\s*QTY:\s*\d+)?(?:,\s*PRICE:\s*[\d.]+)?(?:,\s*REASON:\s*([^\]]+))?\]/i);
+      return match?.[1]?.trim() || "";
+    }
+
+    function metaFooter(metadata) {
+      if (!metadata || !Object.keys(metadata).length) return "";
+      const channel = metadata.channel || "N/A";
+      const provider = metadata.provider || "";
+      const name = metadata.name || "";
+      const prompt = Number(metadata.prompt_tokens || 0).toLocaleString();
+      const completion = Number(metadata.completion_tokens || 0).toLocaleString();
+      const total = Number(metadata.total_tokens || 0).toLocaleString();
+      const lines = ["", "━━━━━━━━━━━━━━━━━━━━━"];
+      if (provider) {
+        lines.push(`📡 通道: ${channel} | 提供商: ${provider} | 模型: ${name}`);
+      } else {
+        lines.push(`📡 通道: ${channel} | 模型: ${name}`);
+      }
+      lines.push(`📊 Token: 输入 ${prompt} + 输出 ${completion} = 合计 ${total}`);
+      if (metadata.reasoning_tokens) {
+        lines.push(`🧠 Reasoning Token: ${Number(metadata.reasoning_tokens).toLocaleString()}`);
+      }
+      return `\n${lines.join("\n")}`;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function renderInlineMarkdown(value) {
+      let html = escapeHtml(value);
+      html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+      html = html.replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
+      return html;
+    }
+
+    function renderMarkdown(value) {
+      const text = String(value || "");
+      const blocks = [];
+      const fenceRe = /```([a-zA-Z0-9_-]*)\n?([\s\S]*?)```/g;
+      let cursor = 0;
+      let match;
+      while ((match = fenceRe.exec(text)) !== null) {
+        if (match.index > cursor) {
+          blocks.push(renderMarkdownText(text.slice(cursor, match.index)));
+        }
+        const langName = match[1] || "";
+        const code = formatCodeBlock(match[2].trim(), langName);
+        const lang = langName ? ` data-lang="${escapeHtml(langName)}"` : "";
+        blocks.push(`<pre${lang}><code>${escapeHtml(code)}</code></pre>`);
+        cursor = match.index + match[0].length;
+      }
+      if (cursor < text.length) {
+        blocks.push(renderMarkdownText(text.slice(cursor)));
+      }
+      return blocks.join("");
+    }
+
+    function formatCodeBlock(code, lang) {
+      const normalizedLang = String(lang || "").toLowerCase();
+      const trimmed = String(code || "").trim();
+      if (!trimmed) return "";
+      if (normalizedLang === "json" || looksLikeJson(trimmed)) {
+        try {
+          return JSON.stringify(JSON.parse(trimmed), null, 2);
+        } catch (_err) {
+          return trimmed;
+        }
+      }
+      return trimmed;
+    }
+
+    function looksLikeJson(value) {
+      const trimmed = String(value || "").trim();
+      return (trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+        (trimmed.startsWith("[") && trimmed.endsWith("]"));
+    }
+
+    function renderMarkdownText(value) {
+      const lines = String(value || "").replace(/\r\n/g, "\n").split("\n");
+      const html = [];
+      let listOpen = false;
+
+      const closeList = () => {
+        if (listOpen) {
+          html.push("</ul>");
+          listOpen = false;
+        }
+      };
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line) {
+          closeList();
+          continue;
+        }
+        if (/^-{3,}$/.test(line)) {
+          closeList();
+          html.push("<hr>");
+          continue;
+        }
+
+        const heading = line.match(/^(#{1,4})\s+(.+)$/);
+        if (heading) {
+          closeList();
+          const level = heading[1].length;
+          html.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`);
+          continue;
+        }
+
+        const bullet = line.match(/^[-*]\s+(.+)$/);
+        if (bullet) {
+          if (!listOpen) {
+            html.push("<ul>");
+            listOpen = true;
+          }
+          html.push(`<li>${renderInlineMarkdown(bullet[1])}</li>`);
+          continue;
+        }
+
+        closeList();
+        html.push(`<p>${renderInlineMarkdown(line)}</p>`);
+      }
+
+      closeList();
+      return html.join("");
     }
 
     $("filters").addEventListener("submit", (event) => {
@@ -683,6 +945,8 @@ def _available_files(start_date: str, end_date: str, legacy_date: str = "") -> l
 def _extract_action(rec: dict) -> str:
     if rec.get("event_type") != "grid_trigger":
         return ""
+    if rec.get("action"):
+        return str(rec.get("action", "")).upper()
 
     search_text = "\n".join(
         str(rec.get(key, "")) for key in ("ai_output", "tg_message")
