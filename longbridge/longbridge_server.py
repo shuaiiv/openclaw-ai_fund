@@ -63,7 +63,7 @@ os.environ["LONGBRIDGE_LOG_LEVEL"] = "error"
 logging.basicConfig(level=logging.CRITICAL, stream=sys.stderr)
 
 from fastmcp import FastMCP
-from longbridge.openapi import Config, QuoteContext, Period, AdjustType, CalcIndex, Market
+from longbridge.openapi import Config, QuoteContext, Period, AdjustType, CalcIndex, Market, TradeSessions
 
 mcp = FastMCP("longbridge-official")
 
@@ -457,7 +457,18 @@ def _logic_get_history_kline(symbol: str, period: Period, start_date: date, end_
         current_end = end_date
         
         while current_end >= start_date:
-            raw_k = ctx.history_candlesticks_by_date(symbol, period, AdjustType.ForwardAdjust, start_date, current_end)
+            trade_sessions = TradeSessions.All if symbol.endswith(".US") and is_minute else TradeSessions.Intraday
+            try:
+                raw_k = ctx.history_candlesticks_by_date(
+                    symbol,
+                    period,
+                    AdjustType.ForwardAdjust,
+                    start_date,
+                    current_end,
+                    trade_sessions=trade_sessions,
+                )
+            except TypeError:
+                raw_k = ctx.history_candlesticks_by_date(symbol, period, AdjustType.ForwardAdjust, start_date, current_end)
             if not raw_k:
                 break
                 

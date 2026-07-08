@@ -8,6 +8,14 @@ from datetime import datetime, timedelta
 import pytz
 from longbridge.openapi import Period, Market
 
+LB_KLINE_TZ = pytz.timezone("Asia/Shanghai")
+US_EASTERN_TZ = pytz.timezone("America/New_York")
+
+def lb_kline_time_to_et(time_str: str) -> datetime:
+    """Longbridge 美股分钟线时间为北京时间，展示和分段时转换为美东时间。"""
+    t = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+    return LB_KLINE_TZ.localize(t).astimezone(US_EASTERN_TZ)
+
 # ==========================================================
 # 📦 导入公共工具模块（路径设置、缓存、数据获取等均在 shared_utils 中初始化）
 # ==========================================================
@@ -406,13 +414,11 @@ def fetch_kline_data(symbol: str, current_price: float) -> tuple[str, float]:
             return "\n".join(k_data_list), price_change_pct
 
         # 美股：按美东时间分段
-        et = pytz.timezone("America/New_York")
         premarket, regular, afterhours = [], [], []
 
         for k in k_lines:
             try:
-                t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
-                t_et = pytz.utc.localize(t).astimezone(et)
+                t_et = lb_kline_time_to_et(k["t"])
                 h, m = t_et.hour, t_et.minute
                 line = f"{t_et.strftime('%H:%M')} | O:{k['o']} H:{k['h']} L:{k['l']} C:{k['c']} V:{k['v']}"
                 if h < 4:
@@ -435,8 +441,7 @@ def fetch_kline_data(symbol: str, current_price: float) -> tuple[str, float]:
             first_regular_k = None
             for k in k_lines:
                 try:
-                    t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
-                    t_et = pytz.utc.localize(t).astimezone(et)
+                    t_et = lb_kline_time_to_et(k["t"])
                     if (t_et.hour == 9 and t_et.minute >= 30) or t_et.hour >= 10:
                         first_regular_k = k
                         break

@@ -79,6 +79,9 @@ US_SYMBOLS = ["NVDA.US", "TSLA.US", "SPCX.US", "GOOGL.US", "AMD.US", "AAPL.US", 
 # 标的间隔 (秒)
 SYMBOL_INTERVAL = 300  # 5 分钟
 
+LB_KLINE_TZ = pytz.timezone("Asia/Shanghai")
+US_EASTERN_TZ = pytz.timezone("America/New_York")
+
 # 加载 Prompt
 with open(PROMPT_FILE, "r", encoding="utf-8") as f:
     PREMARKET_PROMPT = f.read()
@@ -87,6 +90,11 @@ with open(PROMPT_FILE, "r", encoding="utf-8") as f:
 # ==========================================
 # 🛠️ 盘前专用工具
 # ==========================================
+
+def lb_kline_time_to_et(time_str: str) -> datetime:
+    """Longbridge 美股分钟线时间为北京时间，展示和分段时转换为美东时间。"""
+    t = datetime.strptime(time_str, "%Y-%m-%d %H:%M")
+    return LB_KLINE_TZ.localize(t).astimezone(US_EASTERN_TZ)
 
 def tg_send(text: str):
     """发送 Telegram 消息 (后台免阻塞)"""
@@ -421,7 +429,7 @@ def fetch_min10_kline(symbol: str) -> str:
     """
     获取最近 3 个交易日的 10 分钟 K 线数据。
     - 交易日范围通过 API 交易日历获取，避免连续假期漏缺。
-    - 美股只保留常规盘中数据（09:30-16:00 美东时间），过滤盘前/盘后。
+    - 美股按美东时间标注盘前/盘中/盘后，保留延伸时段数据。
     """
     market = "US" if symbol.endswith(".US") else "HK"
     cache_file = f"min10_kline_{symbol.replace('.', '_')}.json"
@@ -434,8 +442,9 @@ def fetch_min10_kline(symbol: str) -> str:
         latest_date_str = cached[-1].get("t", "")[:10]
         try:
             latest_date = datetime.strptime(latest_date_str, "%Y-%m-%d").date()
-            # 如果最新日期是昨天或今天，且数据量足够，跳过
-            if (today - latest_date).days <= 1 and len(cached) >= 30:
+            # 如果最新日期是昨天或今天，且数据量足够覆盖多日分钟结构，跳过
+            min_expected = 100 if market == "US" else 60
+            if (today - latest_date).days <= 1 and len(cached) >= min_expected:
                 need_fetch = False
         except (ValueError, IndexError):
             pass
@@ -455,15 +464,11 @@ def fetch_min10_kline(symbol: str) -> str:
 
     # 美股：按美东时间分段标注（盘前/盘中/盘后），保留完整延伸时段数据
     if market == "US":
-        et = pytz.timezone("America/New_York")
-        sections = []
-        current_session = None
-        count = 0
+        rows = []
 
         for k in cached:
             try:
-                t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
-                t_et = pytz.utc.localize(t).astimezone(et)
+                t_et = lb_kline_time_to_et(k["t"])
                 h, m = t_et.hour, t_et.minute
                 time_str = t_et.strftime("%m-%d %H:%M")
 
@@ -478,19 +483,24 @@ def fetch_min10_kline(symbol: str) -> str:
                 else:
                     continue
 
-                if session != current_session:
-                    sections.append(f"--- {session} ---")
-                    current_session = session
-
-                sections.append(f"{time_str} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}")
-                count += 1
+                rows.append((session, f"{time_str} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}"))
             except Exception:
-                sections.append(f"{k['t']} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}")
-                count += 1
+                rows.append(("📈 盘中", f"{k['t']} | {k['o']} | {k['h']} | {k['l']} | {k['c']} | {k['v']}"))
 
-        lines = [f"📈 近3个交易日10分钟K线 ({count}条，含盘前/盘后):"]
+        max_rows = 180
+        selected_rows = rows[-max_rows:]
+        sections = []
+        current_session = None
+        for session, line in selected_rows:
+            if session != current_session:
+                sections.append(f"--- {session} ---")
+                current_session = session
+            sections.append(line)
+
+        count_label = f"{len(rows)}条" if len(rows) == len(selected_rows) else f"展示{len(selected_rows)}/{len(rows)}条"
+        lines = [f"📈 近3个交易日10分钟K线 ({count_label}，含盘前/盘后):"]
         lines.append("时间(美东) | 开 | 高 | 低 | 收 | 成交量")
-        lines.extend(sections[-180:])
+        lines.extend(sections)
         return "\n".join(lines)
 
     # 非美股：直接输出全量
@@ -515,8 +525,6 @@ def fetch_premarket_kline_us(symbol: str) -> str:
         return ""
 
     try:
-        import pytz
-        et = pytz.timezone("America/New_York")
         today = datetime.now().date()
         k_lines = _logic_get_history_kline(symbol, Period.Min_5, today, today)
 
@@ -526,8 +534,7 @@ def fetch_premarket_kline_us(symbol: str) -> str:
         premarket = []
         for k in k_lines:
             try:
-                t = datetime.strptime(k["t"], "%Y-%m-%d %H:%M")
-                t_et = pytz.utc.localize(t).astimezone(et)
+                t_et = lb_kline_time_to_et(k["t"])
                 h, m = t_et.hour, t_et.minute
                 # 盘前时段：04:00–09:29
                 if 4 <= h < 9 or (h == 9 and m < 30):
