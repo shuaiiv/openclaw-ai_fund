@@ -40,7 +40,8 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OpenClaw AI 日志</title>
+  <title>AI Fund Log</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='0.9em' font-size='90'%3E📈%3C/text%3E%3C/svg%3E">
   <style>
     :root {
       color-scheme: light;
@@ -228,6 +229,7 @@ HTML = r"""<!doctype html>
 
     .pill.hk { color: #9f3328; border-color: #ebb2aa; background: #fff0ee; }
     .pill.us { color: #28558a; border-color: #a8c7e8; background: #edf5ff; }
+    .pill.symbol-code { color: #7f241e; border-color: #c98b82; background: #f4d9d5; }
     .pill.event-premarket { color: #6b3a83; border-color: #d5b7e2; background: #f7edf9; }
     .pill.event-grid { color: #9c3268; border-color: #e6adc9; background: #fff0f6; }
     .pill.event-rebuild { color: #28558a; border-color: #a8c7e8; background: #edf5ff; }
@@ -394,7 +396,7 @@ HTML = r"""<!doctype html>
 </head>
 <body>
   <header>
-    <h1>OpenClaw AI 日志</h1>
+    <h1>📈 AI Fund Log</h1>
     <div class="status" id="status">读取中...</div>
   </header>
 
@@ -542,7 +544,7 @@ HTML = r"""<!doctype html>
         const meta = document.createElement("div");
         meta.className = "meta";
         meta.append(pill(marketLabel(rec.market), (rec.market || "").toLowerCase()));
-        meta.append(pill(rec.symbol || "-"));
+        meta.append(pill(rec.symbol || "-", "symbol-code"));
         meta.append(pill(eventLabels[rec.event_type] || rec.event_type || "-", eventClass(rec.event_type)));
         if (rec.event_type === "grid_trigger" && rec.action) {
           meta.append(pill(actionLabel(rec.action), actionClass(rec.action)));
