@@ -60,7 +60,8 @@ HTML = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>每日盈亏</title>
+  <title>📈 每日盈亏</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E📈%3C/text%3E%3C/svg%3E">
   <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.1/dist/echarts.min.js"></script>
   <style>
     :root {
@@ -278,7 +279,7 @@ HTML = """<!doctype html>
 <body>
   <div class="shell">
     <header>
-      <h1>每日盈亏</h1>
+      <h1>📈 每日盈亏</h1>
       <div class="toolbar">
         <div class="segmented" aria-label="市场">
           <button id="marketUS" class="active" data-market="US">美股</button>
@@ -402,6 +403,14 @@ HTML = """<!doctype html>
 
     const latest = (rows) => rows.length ? rows[rows.length - 1] : null;
 
+    const periodReturnSeries = (rows) => {
+      let factor = 1;
+      return rows.map((row) => {
+        factor *= 1 + (Number(row.total_pnl_pct) || 0);
+        return factor - 1;
+      });
+    };
+
     async function loadData() {
       const params = new URLSearchParams({ market, platform, ...rangeParams() });
       const res = await fetch(`/api/pnl?${params.toString()}`);
@@ -414,9 +423,9 @@ HTML = """<!doctype html>
 
     function updateMetrics(rows) {
       const last = latest(rows);
+      const periodReturn = latest(periodReturnSeries(rows));
       const fields = {
         totalPnl: ["cumulative_total_pnl", fmtMoney],
-        totalPct: ["cumulative_total_pnl_pct", fmtPct],
         realizedPnl: ["cumulative_realized_pnl", fmtMoney],
         realizedPct: ["cumulative_realized_pnl_pct", fmtPct],
         unrealizedPnl: ["cumulative_unrealized_pnl", fmtMoney],
@@ -431,6 +440,10 @@ HTML = """<!doctype html>
         if (key.includes("pnl")) setTone(el, last ? last[key] : 0);
       });
 
+      const totalPctEl = document.getElementById("totalPct");
+      totalPctEl.textContent = last ? `累计 ${fmtPct(last.cumulative_total_pnl_pct)} · 区间 ${fmtPct(periodReturn)}` : "-";
+      setTone(totalPctEl, periodReturn || 0);
+
       document.getElementById("latestDate").textContent = last ? last.date : "-";
       document.getElementById("rowCount").textContent = `${rows.length} 条记录`;
     }
@@ -442,9 +455,11 @@ HTML = """<!doctype html>
       const total = rows.map((row) => row.cumulative_total_pnl);
       const marketValue = rows.map((row) => row.market_value);
       const totalPct = rows.map((row) => row.cumulative_total_pnl_pct * 100);
+      const unrealizedPct = rows.map((row) => row.cumulative_unrealized_pnl_pct * 100);
+      const periodReturnPct = periodReturnSeries(rows).map((value) => value * 100);
 
       chart.setOption({
-        color: ["#176f6b", "#3f6fb5", "#c94747", "#8a6f3d", "#d88b26"],
+        color: ["#176f6b", "#3f6fb5", "#c94747", "#8a6f3d", "#d88b26", "#7b5fd6", "#b35aa3"],
         tooltip: {
           trigger: "axis",
           formatter: (params) => {
@@ -459,7 +474,7 @@ HTML = """<!doctype html>
         },
         legend: {
           top: 8,
-          data: ["累计总收益", "累计已实现", "持仓浮盈", "持仓市值", "累计收益%"]
+          data: ["累计总收益", "累计已实现", "持仓浮盈", "持仓市值", "累计收益%", "区间收益%", "浮盈率%"]
         },
         grid: { left: 88, right: 72, top: 54, bottom: 72 },
         dataZoom: [
@@ -492,7 +507,9 @@ HTML = """<!doctype html>
           { name: "累计已实现", type: "line", yAxisIndex: 0, data: realized, showSymbol: false, smooth: 0.2, lineStyle: { width: 2 } },
           { name: "持仓浮盈", type: "line", yAxisIndex: 0, data: unrealized, showSymbol: false, smooth: 0.2, lineStyle: { width: 2 } },
           { name: "持仓市值", type: "line", yAxisIndex: 0, data: marketValue, showSymbol: false, smooth: 0.15, lineStyle: { width: 2, opacity: 0.82 } },
-          { name: "累计收益%", type: "line", yAxisIndex: 1, data: totalPct, showSymbol: false, smooth: 0.2, lineStyle: { width: 1.8, type: "dashed" } }
+          { name: "累计收益%", type: "line", yAxisIndex: 1, data: totalPct, showSymbol: false, smooth: 0.2, lineStyle: { width: 1.8, type: "dashed" } },
+          { name: "区间收益%", type: "line", yAxisIndex: 1, data: periodReturnPct, showSymbol: false, smooth: 0.2, lineStyle: { width: 2, type: "solid" } },
+          { name: "浮盈率%", type: "line", yAxisIndex: 1, data: unrealizedPct, showSymbol: false, smooth: 0.2, lineStyle: { width: 1.8, type: "dotted" } }
         ]
       }, true);
     }
@@ -502,24 +519,27 @@ HTML = """<!doctype html>
       const realized = rows.map((row) => row.realized_pnl);
       const unrealized = rows.map((row) => row.unrealized_pnl);
       const total = rows.map((row) => row.total_pnl);
+      const totalPct = rows.map((row) => row.total_pnl_pct * 100);
 
       dailyChart.setOption({
-        color: ["#176f6b", "#3f6fb5", "#c94747"],
+        color: ["#176f6b", "#3f6fb5", "#c94747", "#d88b26"],
         tooltip: {
           trigger: "axis",
           formatter: (params) => {
             const lines = [params[0]?.axisValue || ""];
             params.forEach((item) => {
-              lines.push(`${item.marker}${item.seriesName}: ${fmtMoney(item.value)}`);
+              const isPct = item.seriesName.includes("%");
+              const value = isPct ? `${Number(item.value).toFixed(2)}%` : fmtMoney(item.value);
+              lines.push(`${item.marker}${item.seriesName}: ${value}`);
             });
             return lines.join("<br/>");
           }
         },
         legend: {
           top: 8,
-          data: ["每日总盈亏", "每日已实现", "每日未实现"]
+          data: ["每日总盈亏", "每日已实现", "每日未实现", "每日总盈亏%"]
         },
-        grid: { left: 88, right: 24, top: 54, bottom: 64 },
+        grid: { left: 88, right: 72, top: 54, bottom: 64 },
         dataZoom: [
           { type: "inside", throttle: 40 },
           { type: "slider", height: 22, bottom: 18 }
@@ -530,16 +550,25 @@ HTML = """<!doctype html>
           axisLabel: { color: "#70757a" },
           axisLine: { lineStyle: { color: "#d6d6cf" } }
         },
-        yAxis: {
-          type: "value",
-          name: `每日盈亏 (${currency()})`,
-          axisLabel: { formatter: (v) => fmtAxisMoney(v), color: "#70757a" },
-          splitLine: { lineStyle: { color: "#eeeeea" } }
-        },
+        yAxis: [
+          {
+            type: "value",
+            name: `每日盈亏 (${currency()})`,
+            axisLabel: { formatter: (v) => fmtAxisMoney(v), color: "#70757a" },
+            splitLine: { lineStyle: { color: "#eeeeea" } }
+          },
+          {
+            type: "value",
+            name: "%",
+            axisLabel: { formatter: "{value}%", color: "#70757a" },
+            splitLine: { show: false }
+          }
+        ],
         series: [
-          { name: "每日总盈亏", type: "bar", data: total, barMaxWidth: 18, itemStyle: { opacity: 0.72 } },
-          { name: "每日已实现", type: "bar", stack: "daily", data: realized, barMaxWidth: 18, itemStyle: { opacity: 0.78 } },
-          { name: "每日未实现", type: "bar", stack: "daily", data: unrealized, barMaxWidth: 18, itemStyle: { opacity: 0.78 } }
+          { name: "每日总盈亏", type: "bar", yAxisIndex: 0, data: total, barMaxWidth: 18, itemStyle: { opacity: 0.72 } },
+          { name: "每日已实现", type: "bar", yAxisIndex: 0, stack: "daily", data: realized, barMaxWidth: 18, itemStyle: { opacity: 0.78 } },
+          { name: "每日未实现", type: "bar", yAxisIndex: 0, stack: "daily", data: unrealized, barMaxWidth: 18, itemStyle: { opacity: 0.78 } },
+          { name: "每日总盈亏%", type: "line", yAxisIndex: 1, data: totalPct, showSymbol: false, smooth: 0.2, lineStyle: { width: 1.8, type: "dashed" } }
         ]
       }, true);
     }
