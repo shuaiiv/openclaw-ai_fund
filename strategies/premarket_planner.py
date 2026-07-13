@@ -74,7 +74,7 @@ PROMPT_FILE = os.path.join(_ROOT_DIR, "prompts", "premarket_planner_prompt.md")
 
 # 标的列表
 HK_SYMBOLS = ["0700.HK", "09988.HK", "01810.HK", "00100.HK", "02513.HK", "06082.HK", "07709.HK"]
-US_SYMBOLS = ["NVDA.US", "TSLA.US", "SPCX.US", "GOOGL.US", "AMD.US", "AAPL.US", "INTC.US", "MU.US", "SNDK.US", "DRAM.US", "GLD.US"]
+US_SYMBOLS = ["NVDA.US", "TSLA.US", "SPCX.US", "GOOGL.US", "AMD.US", "AAPL.US", "INTC.US", "SKHY.US", "MU.US", "SNDK.US", "DRAM.US", "GLD.US"]
 
 # 标的间隔 (秒)
 SYMBOL_INTERVAL = 300  # 5 分钟
